@@ -1,4 +1,4 @@
-# adsb-trace-pipeline
+# adsb-lol-globle-catmull-rom
 
 Daily pipeline that turns the [adsblol `globe_history`](https://github.com/adsblol/globe_history_2026/releases)
 ADS-B trace dump into compact, smooth per-airport flight tracks for a browser 3-D
