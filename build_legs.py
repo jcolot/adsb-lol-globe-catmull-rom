@@ -10,8 +10,10 @@ Pipeline:
   2. find airborne runs that actually go somewhere (>2 km horizontal), split the
      day at the temporal midpoint between consecutive flights -> one leg each,
      taxi-out + airborne + taxi-in;
-  3. departure = nearest airport to the leg's first on-ground fix, arrival = nearest
-     to its last on-ground fix (airports.csv, <=10 km);
+  3. departure = nearest airport to the leg's first end-window anchor, arrival =
+     nearest to its last (airports.csv, <=10 km). The anchor is a ground fix when
+     the window has one, else the window's lowest fix, so airports with thin
+     surface coverage still resolve;
   4. write points_legs.parquet (one row/point, with dep/arr/leg_id), flights.parquet
      (one row/leg = the index, sorted by dep), and airports/airport=XXXX/*.parquet
      (each leg written under BOTH its dep and arr airport).
@@ -26,6 +28,8 @@ import pyarrow.parquet as pq
 
 FLIGHT_MIN_KM = 2.0     # an airborne run must span this to count as a flight
 NEAR_KM = 10.0          # max distance from a fix to call it "at" an airport
+ENDPOINT_FRAC = 0.25    # search this much of the leg at each end for an anchor
+ENDPOINT_MIN_PTS = 5    # ...but always look at at least this many points
 
 
 def build_airport_index(path):
@@ -113,11 +117,38 @@ def segment(ts, la, lo, alt, gnd):
     return leg_of, legs
 
 
-def endpoint_airport(la, lo, gnd, i0, i1, resolve):
-    """Nearest airport to the first/last on-ground fix of the leg (fallback: ends)."""
-    grounds = [i for i in range(i0, i1 + 1) if gnd[i]]
-    dep_i = grounds[0] if grounds else i0
-    arr_i = grounds[-1] if grounds else i1
+def _anchor(al, gnd, idxs, head):
+    """Index of the best airport-anchor within one end-window of a leg.
+
+    on_ground is the least reliably received bit in the feed: surface position
+    messages are low-power and need a receiver with near line-of-sight to the
+    field, so half the aircraft in a day's traces never produce one at all, and
+    airports with thin local coverage produce almost none. Prefer a ground fix
+    when the window has one, but fall back to the window's LOWEST fix -- the
+    climb-out or the approach -- instead of giving up, so a field can still be
+    resolved from the air.
+    """
+    grounds = [i for i in idxs if gnd[i]]
+    if grounds:
+        return grounds[0] if head else grounds[-1]
+    return min(idxs, key=lambda i: al[i])
+
+
+def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
+    """Nearest airport to each TEMPORAL end of the leg.
+
+    The two windows are disjoint by construction, and that is what keeps a leg
+    from being labelled X->X: scanning the WHOLE leg for "first ground fix" and
+    "last ground fix" puts both of them on whichever end happened to have
+    surface coverage, so a flight out of a thinly-covered field was recorded as
+    departing from its own destination -- losing it for the real origin and
+    inventing a self-loop at the destination.
+    """
+    n = i1 - i0 + 1
+    w = max(ENDPOINT_MIN_PTS, int(n * ENDPOINT_FRAC))
+    w = min(w, max(1, n // 2))              # never let head and tail overlap
+    dep_i = _anchor(al, gnd, range(i0, i0 + w), True)
+    arr_i = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
     dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5)
     arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5)
     return dep, arr
@@ -193,7 +224,7 @@ def main():
             return 0
         reg, typ = meta.get(icao, (None, None))
         for k, (i0, i1) in enumerate(legs):
-            dep, arr = endpoint_airport(la, lo, gd, i0, i1, resolve)
+            dep, arr = endpoint_airport(la, lo, al, gd, i0, i1, resolve)
             leg_id = f"{icao}_{k}"
             for idx in range(i0, i1 + 1):
                 pbuf["icao"].append(icao); pbuf["t"].append(ts[idx])
