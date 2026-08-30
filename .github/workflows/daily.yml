@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "0 4 * * *"   # 04:00 UTC — after the ~03:26 UTC prod-0 release drops
   workflow_dispatch:       # allow manual runs from the Actions tab
+    inputs:
+      date:
+        description: "Data date to process, YYYY-MM-DD (empty = latest release)"
+        required: false
+        default: ""
+      retention_days:
+        description: "Keep the newest N date partitions in R2"
+        required: false
+        default: "30"
 
 permissions:
   contents: read           # gh needs only read access to the (public) source repo
@@ -21,7 +30,10 @@ jobs:
       VARIANT: prod-0
       R2_BUCKET: ${{ vars.R2_BUCKET }}
       R2_PREFIX: legs
-      RETENTION_DAYS: "30"   # keep the newest N date partitions; older are pruned
+      SRC_DATE: ${{ inputs.date }}
+      # A backfill of an OLD day must raise this, or the prune step deletes the
+      # very partition the run just uploaded (it keeps the newest N by date).
+      RETENTION_DAYS: ${{ inputs.retention_days || '30' }}
       # rclone S3 remote "r2" assembled entirely from env (no config file)
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
