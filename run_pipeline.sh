@@ -4,6 +4,7 @@
 #   fetch    -> stream the split-tar assets straight into tar (no 4-6 GB staged)
 #   fit      -> fit sparse Catmull-Rom spline nodes (fit_spline.py)
 #   legs     -> split into per-airport leg partitions (build_legs.py)
+#   hexes    -> aggregate into H3 traffic-density vector tiles (build_hexes.py)
 #   upload   -> rclone sync the legs to Cloudflare R2
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
 # / `run_pipeline.sh all`). Phases share state through $WORK (the resolved tag is
@@ -20,6 +21,11 @@ R2_PREFIX="${R2_PREFIX:-legs}"
 TOL_GROUND="${TOL_GROUND:-2}"
 TOL_CRUISE="${TOL_CRUISE:-150}"
 CORNER="${CORNER:-35}"
+HEX_MAX_RES="${HEX_MAX_RES:-6}"        # 6 = 3.2 km edge, drawn at z8
+HEX_MIN_RES="${HEX_MIN_RES:-0}"
+HEX_STEP_KM="${HEX_STEP_KM:-1.5}"      # keep <= half the finest hex edge
+HEX_BUCKETS="${HEX_BUCKETS:-16}"
+HEX_MEMORY="${HEX_MEMORY:-}"           # e.g. 10GB; empty = DuckDB default
 TAGFILE="$WORK/TAG"
 
 resolve() {
@@ -60,6 +66,18 @@ legs() {
         --meta "$WORK/nodes/aircraft.parquet" --out-dir "$OUT/legs"
 }
 
+# Writes traffic.pmtiles INTO $OUT/legs so the existing upload picks it up with
+# the rest of the day's prefix. Must run after legs() (which rm -rf's that dir).
+hexes() {
+    python3 "$SCRIPT_DIR/build_hexes.py" \
+        --points "$OUT/legs/points_legs.parquet" \
+        --out "$OUT/legs/traffic.pmtiles" \
+        --tmp "$WORK/hex" \
+        --max-res "$HEX_MAX_RES" --min-res "$HEX_MIN_RES" \
+        --step-km "$HEX_STEP_KM" --buckets "$HEX_BUCKETS" \
+        ${HEX_MEMORY:+--memory-limit "$HEX_MEMORY"}
+}
+
 upload() {
     : "${R2_BUCKET:?set R2_BUCKET (Cloudflare R2 bucket name)}"
     local keep="${RETENTION_DAYS:-30}"
@@ -97,7 +115,8 @@ case "${1:-all}" in
     fetch)   fetch ;;
     fit)     fit ;;
     legs)    legs ;;
+    hexes)   hexes ;;
     upload)  upload ;;
-    all)     resolve; fetch; fit; legs; upload ;;
-    *) echo "usage: $0 [resolve|fetch|fit|legs|upload|all]" >&2; exit 2 ;;
+    all)     resolve; fetch; fit; legs; hexes; upload ;;
+    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|upload|all]" >&2; exit 2 ;;
 esac

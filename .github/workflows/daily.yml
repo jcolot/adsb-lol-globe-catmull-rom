@@ -22,6 +22,8 @@ jobs:
       R2_BUCKET: ${{ vars.R2_BUCKET }}
       R2_PREFIX: legs
       RETENTION_DAYS: "30"   # keep the newest N date partitions; older are pruned
+      TIPPECANOE_REF: "2.72.0"
+      HEX_MEMORY: "12GB"     # runner has 16 GB; leave headroom for tippecanoe
       # rclone S3 remote "r2" assembled entirely from env (no config file)
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
@@ -41,7 +43,30 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone build-essential libsqlite3-dev zlib1g-dev
+
+      # tippecanoe isn't packaged for ubuntu-latest; ~1 min from source, cached
+      # by ref so subsequent runs just restore the binaries.
+      - name: Cache tippecanoe
+        id: tippecanoe-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin
+          key: tippecanoe-${{ env.TIPPECANOE_REF }}-${{ runner.os }}
+
+      - name: Build tippecanoe
+        if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b "$TIPPECANOE_REF" https://github.com/felt/tippecanoe /tmp/tippecanoe
+          make -j"$(nproc)" -C /tmp/tippecanoe
+          mkdir -p ~/.local/bin
+          cp /tmp/tippecanoe/tippecanoe /tmp/tippecanoe/tippecanoe-decode \
+             /tmp/tippecanoe/tile-join ~/.local/bin/
+
+      - name: Put tippecanoe on PATH
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Resolve latest release
         run: bash run_pipeline.sh resolve
@@ -54,6 +79,9 @@ jobs:
 
       - name: Build per-airport legs
         run: bash run_pipeline.sh legs
+
+      - name: Build H3 traffic tiles
+        run: bash run_pipeline.sh hexes
 
       - name: Upload to R2
         run: bash run_pipeline.sh upload
