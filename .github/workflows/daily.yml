@@ -24,6 +24,7 @@ jobs:
       RETENTION_DAYS: "30"   # keep the newest N date partitions; older are pruned
       TIPPECANOE_REF: "2.72.0"
       HEX_MEMORY: "12GB"     # runner has 16 GB; leave headroom for tippecanoe
+      BUNDLE_MEMORY: "12GB"
       # rclone S3 remote "r2" assembled entirely from env (no config file)
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
@@ -82,6 +83,9 @@ jobs:
 
       - name: Build H3 traffic tiles
         run: bash run_pipeline.sh hexes
+
+      - name: Build + verify day bundle
+        run: bash run_pipeline.sh bundle
 
       - name: Upload to R2
         run: bash run_pipeline.sh upload

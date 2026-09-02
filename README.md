@@ -16,9 +16,11 @@ airport it's showing.
 Result: ~37× smaller than the source, no overshoot, sharp taxi corners (cusps),
 stable ground altitude, and no parked-at-gate "scribbles".
 
-It also builds a derived overview layer over the same day: **H3 traffic-density
-vector tiles** (`traffic.pmtiles`), one file per day, for the zoom levels where
-fetching per-airport partitions makes no sense.
+It also builds two derived layers over the same day: **H3 traffic-density vector
+tiles** (`traffic.pmtiles`) for the world-zoom overview, and a **day bundle** —
+about 8 MB of index shipped up front that makes every flight findable by
+callsign/registration/hex/route and answers "which flights went through this
+box?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages
 
@@ -29,6 +31,9 @@ fetching per-airport partitions makes no sense.
    `flights.parquet` index).
 3. **`build_hexes.py`** — `points_legs.parquet → traffic.pmtiles` (H3
    traffic-density vector tiles; a global overview layer, see below).
+4. **`build_bundle.py`** — `points_legs.parquet → legs.parquet + cells.bin +
+   tracks.bin + meta.json` (the queryable **day bundle**, see below).
+   `verify_bundle.py` is its correctness gate and the reference decoder.
 
 `smooth_trace.py`, `compress_trace.py`, `validate_recon.py` are supporting /
 diagnostic modules (`validate_recon.py` measures reconstruction error vs raw).
@@ -60,6 +65,10 @@ python3 build_legs.py --traces nodes/nodes.parquet \
     --meta nodes/aircraft.parquet --out-dir out/legs
 python3 build_hexes.py --points out/legs/points_legs.parquet \
     --out out/legs/traffic.pmtiles
+python3 build_bundle.py --points out/legs/points_legs.parquet \
+    --meta nodes/aircraft.parquet --out-dir out/legs
+python3 verify_bundle.py --bundle out/legs \
+    --points out/legs/points_legs.parquet --meta nodes/aircraft.parquet
 ```
 
 `build_hexes.py` needs [tippecanoe](https://github.com/felt/tippecanoe) ≥ 2.17 on
@@ -68,8 +77,7 @@ extension on first run, so that step needs network access. `--no-tiles` stops
 after the per-resolution `.geojsonl` files if you only want the aggregation.
 
 `run_pipeline.sh` does the whole daily job end-to-end (resolve latest release →
-stream-extract → fit → legs → hexes → upload to R2). It streams the ~4 GB
-split-tar
+stream-extract → fit → legs → hexes → bundle → upload to R2). It streams the ~4 GB split-tar
 download straight into `tar`, so peak disk is just the ~2.9 GB extracted tree.
 
 ## H3 traffic-density tiles (`traffic.pmtiles`)
@@ -159,11 +167,136 @@ ramp other than `d`.
 Known limitation: cells straddling the antimeridian are emitted twice (shifted
 ±360°) so tippecanoe clips each copy to the world and both halves draw.
 
+## The day bundle
+
+Four files per day that make every flight findable and every "what flew through
+this box?" answerable. Built by `build_bundle.py`; `verify_bundle.py` gates it.
+
+The design turns on one observation: **the two queries want different structures,
+and only one of them needs the geometry.** "Which flights went through this box?"
+is set membership, answerable from an index small enough to hold in memory.
+"Draw flight X" is a byte-range question.
+
+| question | answered by | cost |
+|---|---|---|
+| how much traffic is here? | `traffic.pmtiles` | tile reads |
+| which flights went through this box? | `cells.bin` + `legs.parquet`, both resident | **zero requests** |
+| find and draw flight X | `legs.parquet` → `tracks.bin` | one range read |
+
+Because the box query never touches the payload, `tracks.bin` is free to be
+clustered for whole-flight retrieval instead — which dissolves the tension that
+would otherwise force two copies of the geometry.
+
+### `legs.parquet` — one row per leg, shipped whole
+
+`lid`, `icao`, `reg`, `type`, `dep`, `arr`, `t0`, `t1`, `n_nodes`, the bounding
+box (`min_lat`…`max_lon`, degrees × 1e5), `min_alt`/`max_alt` in feet, and
+`off`/`len` — the byte range of that leg's record in `tracks.bin`.
+
+**`lid` is the row index**, so a posting list from `cells.bin` indexes this table
+directly with no lookup map.
+
+Row order is `(dep, t0)`, which means **every departure from one airport is a
+single contiguous byte range** in `tracks.bin` — the property the per-airport
+partitions existed to provide, now without needing an airport directory. Legs
+with no `dep` go in a tail bucket ordered by H3 anchor cell.
+
+`t0`/`t1` are **deciseconds from `meta.json`/`t_epoch`** (UTC midnight of the data
+date). This matters: `nodes.parquet` stores `t` relative to each *aircraft's*
+`base_ts`, so raw `t` is not comparable between flights. `build_bundle.py` joins
+`aircraft.parquet` to rebase everything on one epoch — which is why it needs
+`--meta`.
+
+### `cells.bin` — H3 inverted index, shipped whole
+
+```
+offset   size             field
+0        8                magic "ADSBIDX1"
+8        1                version    1
+9        1                res        H3 resolution (default 4)
+10       2                — padding —
+12       4                n_cells    uint32
+16       4                n_legs     uint32
+20       8 x n_cells      cell[]     uint64, ascending H3 index
+…        4 x (n_cells+1)  off[]      uint32 prefix offsets into post[]
+…        —                post[]     per cell: varint gap-coded ascending lids
+```
+
+Lookup is a binary search over `cell[]` and a slice of `post[off[i]..off[i+1]]`.
+Sorted by H3 index because a parent's descendants form exactly **one** contiguous
+run in that order, so "everything under this cell" is a single slice and the
+client can pick its covering resolution by zoom.
+
+Gap-coded posting lists cost ~1.5 bytes per (cell, leg) pair.
+
+### `tracks.bin` — per-leg records, range-read
+
+```
+varint            n           node count
+varint            t0          deciseconds from t_epoch
+
+n x {
+  varint          dt          t[i] - t[i-1],  dt[0] = 0
+  svarint         dlat        delta, degrees x 1e5   (first is absolute)
+  svarint         dlon        delta, degrees x 1e5
+  svarint         dalt        delta, feet
+}
+
+ceil(n/8) B       on_ground   bitplane, LSB-first
+ceil(n/8) B       cusp        bitplane, LSB-first
+```
+
+`svarint` is zigzag + LEB128. Bit *k* of a bitplane is
+`byte[k >> 3] >> (k & 7) & 1`. Flags live in bitplanes at the tail rather than
+interleaved per node: an interleaved flag byte costs a byte per node, two
+bitplanes cost two bits.
+
+`verify_bundle.py` contains the reference decoder in plain Python — the frontend
+decoder should read like `decode_track()` and `CellIndex`.
+
+### Frontend: answering "all flights through this box"
+
+⚠️ **The covering cell set must be ring-expanded.** `polygonToCells` returns cells
+whose *centroid* falls inside the polygon, so a node just inside your box can sit
+in a cell whose centroid is outside it. Take `gridDisk(cell, 1)` of the result or
+you will silently miss flights — measured over 120 random boxes, `polygonToCells`
+alone missed 0.1% of matching legs while the ring-expanded set missed none. Rare
+enough to survive testing, common enough to be a real bug:
+
+```js
+const cover = new Set();
+for (const c of h3.polygonToCells(boxRing, meta.index_res))
+  for (const n of h3.gridDisk(c, 1)) cover.add(n);
+
+const hits = new Set();
+for (const c of cover) for (const lid of idx.get(c)) hits.add(lid);
+// hits now index legs.parquet directly -- callsign, route, times, bbox, all local
+```
+
+The index is **exact at cell granularity, approximate below it**: res 4 cells are
+~45 km across, so a smaller box returns false positives (measured 17–22% on test
+data). There are never false negatives — that is the property `verify_bundle.py`
+asserts. Refine against the leg bbox, then against real geometry, for boxes
+tighter than a cell.
+
+### What this replaces
+
+`points_legs.parquet` is no longer uploaded — `tracks.bin` supersedes it, and
+keeping both would roughly double per-day storage.
+
+`legs/airports/airport=<ICAO>/data_0.parquet` is **still built and uploaded** so
+the current frontend keeps working, but the bundle makes it redundant: `dep`/`arr`
+are columns you can filter in memory. Retiring it is a follow-up once the frontend
+moves over — worth doing, because `build_legs.py` currently writes every leg's
+nodes **twice** (once under its departure partition, once under its arrival).
+
 ## Daily automation
 
 `.github/workflows/daily.yml` runs at **04:00 UTC** (after the ~03:26 UTC
 `prod-0` release drops) and uploads `legs/` to Cloudflare R2 via `rclone`. It
 builds tippecanoe from source (cached by `TIPPECANOE_REF`) for the hexes step.
+The `bundle` phase runs `verify_bundle.py` before upload and fails the job on any
+check — a bundle with wrong byte offsets is worse than no bundle.
 
 ### Configuration
 
@@ -201,6 +334,8 @@ The date is the *data* date, taken from the release tag.
 3. **The leg index** for that day: `.../legs/date=<DATE>/flights.parquet`
 4. **The traffic tiles** for that day: `.../legs/date=<DATE>/traffic.pmtiles`
    (plus `traffic.pmtiles.stats.json`)
+5. **The day bundle** for that day: `.../legs/date=<DATE>/` →
+   `meta.json`, `legs.parquet`, `cells.bin`, `tracks.bin`
 
 **Exactly one file per airport.** The per-airport write is single-threaded so each
 partition is a single `data_0.parquet` (DuckDB's parallel partitioned write would

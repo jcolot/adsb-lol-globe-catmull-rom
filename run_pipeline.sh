@@ -5,6 +5,7 @@
 #   fit      -> fit sparse Catmull-Rom spline nodes (fit_spline.py)
 #   legs     -> split into per-airport leg partitions (build_legs.py)
 #   hexes    -> aggregate into H3 traffic-density vector tiles (build_hexes.py)
+#   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (build_bundle.py)
 #   upload   -> rclone sync the legs to Cloudflare R2
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
 # / `run_pipeline.sh all`). Phases share state through $WORK (the resolved tag is
@@ -26,6 +27,11 @@ HEX_MIN_RES="${HEX_MIN_RES:-0}"
 HEX_STEP_KM="${HEX_STEP_KM:-1.5}"      # keep <= half the finest hex edge
 HEX_BUCKETS="${HEX_BUCKETS:-16}"
 HEX_MEMORY="${HEX_MEMORY:-}"           # e.g. 10GB; empty = DuckDB default
+IDX_RES="${IDX_RES:-4}"                # H3 resolution of cells.bin (~45 km cells)
+BUNDLE_BUCKETS="${BUNDLE_BUCKETS:-8}"
+BUNDLE_MEMORY="${BUNDLE_MEMORY:-}"
+VERIFY_LEGS="${VERIFY_LEGS:-2000}"     # legs round-trip decoded by the gate
+VERIFY_BOXES="${VERIFY_BOXES:-25}"
 TAGFILE="$WORK/TAG"
 
 resolve() {
@@ -78,6 +84,23 @@ hexes() {
         ${HEX_MEMORY:+--memory-limit "$HEX_MEMORY"}
 }
 
+# The queryable day bundle. Verification is part of this phase, not a separate
+# one: a bundle whose byte offsets are wrong is worse than no bundle at all, so
+# it must not be possible to upload one that hasn't been checked.
+bundle() {
+    python3 "$SCRIPT_DIR/build_bundle.py" \
+        --points "$OUT/legs/points_legs.parquet" \
+        --meta "$WORK/nodes/aircraft.parquet" \
+        --out-dir "$OUT/legs" \
+        --index-res "$IDX_RES" --buckets "$BUNDLE_BUCKETS" \
+        ${BUNDLE_MEMORY:+--memory-limit "$BUNDLE_MEMORY"}
+    python3 "$SCRIPT_DIR/verify_bundle.py" \
+        --bundle "$OUT/legs" \
+        --points "$OUT/legs/points_legs.parquet" \
+        --meta "$WORK/nodes/aircraft.parquet" \
+        --sample-legs "$VERIFY_LEGS" --boxes "$VERIFY_BOXES"
+}
+
 upload() {
     : "${R2_BUCKET:?set R2_BUCKET (Cloudflare R2 bucket name)}"
     local keep="${RETENTION_DAYS:-30}"
@@ -87,9 +110,12 @@ upload() {
     local date; date="$(printf '%s' "$tag" | sed -nE 's/^v([0-9]{4})\.([0-9]{2})\.([0-9]{2}).*/\1-\2-\3/p')"
     [ -n "$date" ] || { echo "could not parse date from tag: $tag"; exit 1; }
 
-    # each day is its own self-contained prefix (airports/, points_legs, flights);
-    # sync only touches THIS date, so other days are never deleted.
+    # each day is its own self-contained prefix; sync only touches THIS date, so
+    # other days are never deleted. points_legs.parquet is a build intermediate
+    # that tracks.bin now supersedes -- keeping both roughly doubles the per-day
+    # storage, so it stays local.
     rclone sync "$OUT/legs" "$base/date=$date" \
+        --exclude 'points_legs.parquet' \
         --checksum --transfers 16 --fast-list --stats-one-line
 
     # prune to the newest $keep date partitions
@@ -116,7 +142,8 @@ case "${1:-all}" in
     fit)     fit ;;
     legs)    legs ;;
     hexes)   hexes ;;
+    bundle)  bundle ;;
     upload)  upload ;;
-    all)     resolve; fetch; fit; legs; hexes; upload ;;
-    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|upload|all]" >&2; exit 2 ;;
+    all)     resolve; fetch; fit; legs; hexes; bundle; upload ;;
+    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|bundle|upload|all]" >&2; exit 2 ;;
 esac
