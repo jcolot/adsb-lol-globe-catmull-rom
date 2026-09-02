@@ -109,13 +109,19 @@ constant on-screen size:
 
 | source zoom | layer | H3 res | hex edge |
 |---|---|---|---|
-| 2 | `h0` | 0 | 1108 km |
+| 0–2 | `h0` | 0 | 1108 km |
 | 3 | `h1` | 1 | 419 km |
 | 4 | `h2` | 2 | 158 km |
 | 5 | `h3` | 3 | 59.8 km |
 | 6 | `h4` | 4 | 22.6 km |
 | 7 | `h5` | 5 | 8.5 km |
 | 8 | `h6` | 6 | 3.2 km |
+
+The coarsest level also fills every zoom below its own, which is why `h0` covers
+z0–2 rather than just z2. MapLibre never *under*zooms — `coveringTiles()` drops
+any tile below the source's minzoom instead of stretching a parent — so an
+archive starting at z2 renders nothing at all from z0 to z1.9, which is exactly
+the globe view this layer is for. It costs 21 extra tiles.
 
 Above z8 MapLibre overzooms the z8 tiles — hexes just grow, which is the natural
 visual handover to the spline layer. `--max-res` raises the ceiling (res 7 ≈ 1.2 km,
@@ -158,6 +164,16 @@ for (let r = 0; r <= 6; r++) map.addLayer({
   },                           // edges, so outlines would show seams
 });
 ```
+
+Two things that snippet is deliberate about. `fill-opacity` puts **`["zoom"]` as
+the input of the outermost `interpolate`** — MapLibre rejects a `["zoom"]` nested
+anywhere else, and rejects it by *firing an error event rather than throwing*, so
+multiplying a zoom curve by a density curve produces a layer that is silently
+never added. And a single `maxzoom` on every layer (not a per-resolution window,
+which would fight the pyramid) means that once the map is past the handover no
+layer is in range, MapLibre marks the source unused, and the tiles stop being
+requested — so the layer costs nothing on a page that opens zoomed into one
+airport.
 
 `build_hexes.py` also writes `traffic.pmtiles.stats.json` next to the archive
 (cell count, max `n` and the p99 used for `d`, per resolution) — worth watching

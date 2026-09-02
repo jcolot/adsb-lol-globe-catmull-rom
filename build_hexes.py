@@ -277,6 +277,12 @@ def main():
     layers = []
     for r in range(R, a.min_res - 1, -1):
         z = r + a.zoom_offset
+        # The coarsest level also fills every zoom below its own. MapLibre does
+        # not underzoom -- coveringTiles() drops any tile below the source's
+        # minzoom rather than stretching a parent -- so an archive starting at
+        # z2 renders NOTHING from z0 to z1.9, which is exactly the globe view
+        # this layer exists for. 21 extra tiles buys that back.
+        z_lo = 0 if r == a.min_res else z
         con.execute(f"""
             CREATE OR REPLACE TABLE agg_{r} AS
             SELECT p.cell AS cell, count(*)::BIGINT AS n,
@@ -333,9 +339,11 @@ def main():
                   FROM s
                 ) TO '{gj}' (FORMAT csv, HEADER false, DELIMITER E'\\x1f', QUOTE E'\\x01')
             """)
-            print(f"{el()} res {r} -> z{z}: {ncell} cells, max {nmax} flights, "
+            zlabel = f"z{z}" if z_lo == z else f"z{z_lo}-{z}"
+            print(f"{el()} res {r} -> {zlabel}: {ncell} cells, max {nmax} flights, "
                   f"p99 {p99:.0f}  ({os.path.getsize(gj)/1e6:.1f} MB geojsonl)")
-            lay = dict(res=r, zoom=z, cells=ncell, nmax=nmax, p99=p99)
+            lay = dict(res=r, zoom=z, zoom_lo=z_lo, cells=ncell,
+                       nmax=nmax, p99=p99)
             if a.no_tiles:
                 lay["path"] = gj
             else:
@@ -345,7 +353,7 @@ def main():
                 # second-guess them.
                 part = os.path.join(tmp, f"res{r}.pmtiles")
                 subprocess.run(["tippecanoe", "-o", part, "--force",
-                                "-Z", str(z), "-z", str(z), "-l", f"h{r}",
+                                "-Z", str(z_lo), "-z", str(z), "-l", f"h{r}",
                                 "-pf", "-pk", "-ps", "-pt", "--quiet", gj],
                                check=True)
                 os.remove(gj)               # ~10x the tiles; don't keep both
@@ -396,7 +404,7 @@ def main():
                     *[l["path"] for l in layers]], check=True)
     print(f"{el()} DONE: {a.out} ({os.path.getsize(a.out)/1e6:.1f} MB), layers "
           f"h{layers[0]['res']}..h{layers[-1]['res']} at "
-          f"z{layers[0]['zoom']}..z{layers[-1]['zoom']}\n  {stats}")
+          f"z{layers[0]['zoom_lo']}..z{layers[-1]['zoom']}\n  {stats}")
     if not a.keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
 
