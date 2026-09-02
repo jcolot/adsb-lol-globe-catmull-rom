@@ -279,16 +279,39 @@ data). There are never false negatives — that is the property `verify_bundle.p
 asserts. Refine against the leg bbox, then against real geometry, for boxes
 tighter than a cell.
 
-### What this replaces
+### What this replaces, and what it doesn't
 
-`points_legs.parquet` is no longer uploaded — `tracks.bin` supersedes it, and
-keeping both would roughly double per-day storage.
+`points_legs.parquet` is no longer uploaded — nothing reads it, and `tracks.bin`
+supersedes it at a third less size (measured on 2026-09-01: 161 MB vs ~106 MB for
+the same 14.4 M nodes).
 
-`legs/airports/airport=<ICAO>/data_0.parquet` is **still built and uploaded** so
-the current frontend keeps working, but the bundle makes it redundant: `dep`/`arr`
-are columns you can filter in memory. Retiring it is a follow-up once the frontend
-moves over — worth doing, because `build_legs.py` currently writes every leg's
-nodes **twice** (once under its departure partition, once under its arrival).
+`legs/airports/airport=<ICAO>/data_0.parquet` is **still built and uploaded, and
+should stay that way.** An earlier draft of this section claimed the bundle made
+it redundant; measuring the read pattern showed that's only half true, and the
+half it gets wrong is the expensive half.
+
+The `(dep, t0)` sort puts every *departure* from one airport in a single byte
+range, so those cost one request. *Arrivals* into that airport are scattered —
+each sits in its own departure airport's run — and coalescing adjacent ranges
+trades requests for bandwidth on terrible terms (2026-09-01, EBBR, 308 arrivals
+totalling 0.30 MB of payload):
+
+| gap tolerance | requests | bytes fetched |
+|---|---|---|
+| exact ranges | 238 | 0.30 MB |
+| 64 KB | 92 | 2.96 MB |
+| 256 KB | 32 | 11.16 MB |
+| 1 MB | 8 | 22.16 MB |
+
+The per-airport partition delivers the same 555 legs in **one** 0.71 MB request.
+So the two layouts are not competing: `build_legs.py`'s double-write **is** the
+arrival-clustered copy, which is the thing the bundle's single ordering
+structurally cannot also be. Keeping it costs far less than a second
+`(arr, t0)`-ordered copy of `tracks.bin` would.
+
+What the bundle uniquely buys, then, is not the airport fan but the queries the
+partitions can't answer at all: box containment, any-airport-without-a-prebuild,
+and finding one flight by identity across the whole day.
 
 ## Daily automation
 
