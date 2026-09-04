@@ -21,7 +21,7 @@ Usage:
     ./fit_spline.py subset_ebbr/traces --ground-elevation --parquet nodes   # batch
     ./fit_spline.py path/to/trace_full_XXXX.json --dump                     # one flight
 """
-import argparse, glob, gzip, heapq, math, os, sys, time
+import argparse, gzip, heapq, math, os, sys, time
 import importlib.util
 import numpy as np
 
@@ -34,6 +34,11 @@ st = _load("st", os.path.join(HERE, "smooth_trace.py"))
 
 FT = 0.3048
 Q_POS = 1e5            # deg quantum (~1.1 m lat)
+# Above this, a node gap is a coverage hole rather than a tolerance decision, and
+# gets filled along the great circle (insert_gc_nodes). 200 km sits clear of
+# normal cruise node spacing, which is ~20 km median and 55-116 km at p90 over
+# land, so ordinary flight is untouched and only the receiver-less gaps are hit.
+GC_MAX_GAP_KM = float(os.environ.get("GC_MAX_GAP_KM", "200"))
 Q_HAND = 0.5           # handle quantum, metres
 Q_ALT = 25            # ft
 
@@ -433,6 +438,67 @@ def _snap_stationary(ms, stop_kt=3.0, dwell_s=20.0, bbox_m=40.0):
     return ms
 
 
+def insert_gc_nodes(nodes, kx, max_gap_km=200.0):
+    """Fill long node gaps with points along the GREAT CIRCLE.
+
+    A gap of hundreds or thousands of km between consecutive nodes is not a
+    tolerance decision -- it is the volunteer receiver network having no
+    coverage there. Over the open North Atlantic the median gap is ~2,600 km;
+    over land it is ~20 km. Nothing constrains the curve across such a gap, and
+    what gets drawn is whatever the reconstruction happens to do: a
+    centripetal-CR span between two nodes 3,000 km apart, or (in a pixel-space
+    densifier) a rhumb line of constant bearing. Neither is the route flown.
+
+    So the gap is filled with nodes on the great circle between its ends. This
+    does NOT make the airspace observed -- it is still interpolation across a
+    hole -- but the interpolation is at least the path an aircraft would fly,
+    and every consumer inherits it: the frontend's spline, the H3 hexbins, the
+    raster, the bundle. Fixing it here rather than in each densifier is the
+    difference between one change and four.
+
+    Nodes carry positions in the local equirectangular frame that
+    build_nodes_cr set up (x = lon * kx * 111320, y = lat * 111320), so the
+    conversion back to lat/lon is exact for this purpose.
+    """
+    if len(nodes) < 2:
+        return nodes
+    M = 111320.0
+    out = [nodes[0]]
+    for a, b in zip(nodes, nodes[1:]):
+        la0, lo0 = a["p"][1] / M, a["p"][0] / (kx * M)
+        la1, lo1 = b["p"][1] / M, b["p"][0] / (kx * M)
+        p0 = _sphere(la0, lo0)
+        p1 = _sphere(la1, lo1)
+        d = max(-1.0, min(1.0, sum(u * v for u, v in zip(p0, p1))))
+        ang = math.acos(d)
+        arc = ang * 6371.0
+        if arc > max_gap_km and ang > 1e-9:
+            k = int(arc // max_gap_km)
+            sa = math.sin(ang)
+            for j in range(1, k + 1):
+                f = j / (k + 1.0)
+                w0 = math.sin((1.0 - f) * ang) / sa
+                w1 = math.sin(f * ang) / sa
+                v = [w0 * p0[i] + w1 * p1[i] for i in range(3)]
+                nl = math.hypot(math.hypot(v[0], v[1]), v[2])
+                v = [c / nl for c in v]
+                la = math.degrees(math.asin(max(-1.0, min(1.0, v[2]))))
+                lo = math.degrees(math.atan2(v[1], v[0]))
+                out.append(dict(p=(lo * kx * M, la * M), gi=a["gi"],
+                                alt=a["alt"] + (b["alt"] - a["alt"]) * f,
+                                gnd=False,
+                                t=a["t"] + (b["t"] - a["t"]) * f,
+                                cusp=False, gc=True))
+        out.append(b)
+    return out
+
+
+def _sphere(lat, lon):
+    p, l = math.radians(lat), math.radians(lon)
+    c = math.cos(p)
+    return (c * math.cos(l), c * math.sin(l), math.sin(p))
+
+
 def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
     """Node placement whose centripetal-CR reconstruction (what the frontend
     draws) stays within the graduated tolerance -- so NO handles need storing.
@@ -497,8 +563,11 @@ def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
             nodes.append(dict(p=P[gi], gi=gi, alt=A[gi], gnd=G[gi], t=T[gi],
                               cusp=(j == 0 and c > 0)))
     if len(nodes) < 2: return None
+    n_fit = len(nodes)
+    nodes = insert_gc_nodes(nodes, kx, GC_MAX_GAP_KM)
     nodes[0]["cusp"] = True; nodes[-1]["cusp"] = True
-    return dict(nodes=nodes, lat0=lat0, kx=kx, n_raw=n0, n_used=len(P))
+    return dict(nodes=nodes, lat0=lat0, kx=kx, n_raw=n0, n_used=len(P),
+                n_fit=n_fit, n_gc=len(nodes) - n_fit)
 
 
 def light_columns(fit):
