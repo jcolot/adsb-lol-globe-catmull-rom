@@ -4,7 +4,7 @@
 #   fetch    -> stream the split-tar assets straight into tar (no 4-6 GB staged)
 #   fit      -> fit sparse Catmull-Rom spline nodes (fit_spline.py)
 #   legs     -> split into per-airport leg partitions (build_legs.py)
-#   hexes    -> aggregate into H3 traffic-density vector tiles (build_hexes.py)
+#   hexes    -> H3 traffic-density tiles: a raster overview + vector hexbins
 #   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (build_bundle.py)
 #   upload   -> rclone sync the legs to Cloudflare R2
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
@@ -27,6 +27,11 @@ HEX_MIN_RES="${HEX_MIN_RES:-0}"
 HEX_STEP_KM="${HEX_STEP_KM:-1.5}"      # keep <= half the finest hex edge
 HEX_BUCKETS="${HEX_BUCKETS:-16}"
 HEX_MEMORY="${HEX_MEMORY:-}"           # e.g. 10GB; empty = DuckDB default
+HEX_RASTER_MAX_Z="${HEX_RASTER_MAX_Z:-4}"   # 512px tiles -> 4.9 km/px, ~= res 6
+HEX_RASTER_TILE="${HEX_RASTER_TILE:-512}"
+HEX_RASTER_GAMMA="${HEX_RASTER_GAMMA:-2}"   # 1 = linear ramp; 2 = sqrt, see hex_raster.py
+HEX_GRID_ZOOM="${HEX_GRID_ZOOM:-2}"    # raw density grid for render_video.py; 2 = 2048px
+HEX_VECTOR="${HEX_VECTOR:-}"           # non-empty also builds traffic.pmtiles
 IDX_RES="${IDX_RES:-4}"                # H3 resolution of cells.bin (~45 km cells)
 BUNDLE_BUCKETS="${BUNDLE_BUCKETS:-8}"
 BUNDLE_MEMORY="${BUNDLE_MEMORY:-}"
@@ -72,12 +77,22 @@ legs() {
         --meta "$WORK/nodes/aircraft.parquet" --out-dir "$OUT/legs"
 }
 
-# Writes traffic.pmtiles INTO $OUT/legs so the existing upload picks it up with
+# Writes both archives INTO $OUT/legs so the existing upload picks them up with
 # the rest of the day's prefix. Must run after legs() (which rm -rf's that dir).
+#
+# Only the raster is built by default. The vector hexbin archive is off because
+# nothing draws it -- the raster replaced it, and at --max-res 6 it was 115 MB a
+# day (85 of that in res 6 alone) against the raster's 8 MB. Set HEX_VECTOR=1 to
+# get it back for per-cell tooltips or queries; that also needs tippecanoe.
 hexes() {
     python3 "$SCRIPT_DIR/build_hexes.py" \
         --points "$OUT/legs/points_legs.parquet" \
-        --out "$OUT/legs/traffic.pmtiles" \
+        --raster-out "$OUT/legs/traffic-raster.pmtiles" \
+        ${HEX_VECTOR:+--out "$OUT/legs/traffic.pmtiles"} \
+        --raster-max-zoom "$HEX_RASTER_MAX_Z" \
+        --raster-tile-size "$HEX_RASTER_TILE" \
+        --raster-gamma "$HEX_RASTER_GAMMA" \
+        --grid-out "$OUT/legs/traffic-grid.npz" --grid-zoom "$HEX_GRID_ZOOM" \
         --tmp "$WORK/hex" \
         --max-res "$HEX_MAX_RES" --min-res "$HEX_MIN_RES" \
         --step-km "$HEX_STEP_KM" --buckets "$HEX_BUCKETS" \
@@ -115,8 +130,21 @@ upload() {
     # that tracks.bin now supersedes -- keeping both roughly doubles the per-day
     # storage, so it stays local.
     rclone sync "$OUT/legs" "$base/date=$date" \
-        --exclude 'points_legs.parquet' \
+        --exclude 'points_legs.parquet' --exclude 'traffic-grid.npz' \
         --checksum --transfers 16 --fast-list --stats-one-line
+
+    # The raw density grid goes to its own prefix, NOT into date=$date, because
+    # the prune below only ever walks date= partitions -- so the grids survive
+    # retention. That is the point of them: they are the only per-day artifact
+    # that is comparable ACROSS days (the raster's alpha is normalised per day),
+    # so a multi-year animation has to be able to reach back past retention.
+    # At ~2 MB/day this is 0.7 GB/year, which is noise against the 30-day
+    # working set. See render_video.py.
+    if [ -f "$OUT/legs/traffic-grid.npz" ]; then
+        rclone copyto "$OUT/legs/traffic-grid.npz" "$base/grids/$date.npz" \
+            --checksum --stats-one-line
+        echo "grid kept beyond retention: $base/grids/$date.npz"
+    fi
 
     # prune to the newest $keep date partitions
     mapfile -t dates < <(rclone lsf --dirs-only "$base/" | sed 's#/$##' | grep '^date=' | sort)

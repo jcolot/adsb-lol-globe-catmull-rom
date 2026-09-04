@@ -35,9 +35,23 @@ Zoom mapping is res = z - 2, one H3 resolution per zoom level, so a hexagon hold
 a constant on-screen size. Above the top zoom MapLibre overzooms: hexes just grow,
 which is the natural visual handover to the spline layer.
 
-Styling: the tiles carry data, not looks -- `n` (distinct flights), `d` (0-255
-log-normalised against that resolution's p99) and `a` (mean altitude, ft). Ramp
-opacity off `d`, not `n`: raw counts aren't comparable across resolutions (a res-0
+Two archives, and the RASTER is the one to draw:
+
+  --raster-out  traffic-raster.pmtiles   PNG pyramid rendered from the FINEST hex
+                                         level, halved down to z0. Keeps the route
+                                         network legible at low zoom, which the
+                                         vector one structurally cannot. See
+                                         hex_raster.py.
+  --out         traffic.pmtiles          vector hexbins, one H3 resolution per
+                                         zoom. OPTIONAL. Only worth building if
+                                         something needs per-cell values (a
+                                         tooltip); omitting it skips the entire
+                                         H3 roll-up and tippecanoe with it.
+
+Vector styling: the tiles carry data, not looks -- `n` (distinct flights through
+the cell), `dens` (mean flights per finest-resolution cell, an area-average), `dn`
+(0-255 linear ramp of `dens`) and `a` (mean altitude, ft). Ramp opacity off `dn`,
+not `n`: raw counts aren't comparable across resolutions (a res-0
 cell swallows ~117x the area of a res-2 cell), so a single ramp on `n` blows out
 at world zoom and vanishes when you zoom in.
 """
@@ -142,17 +156,52 @@ SELECT leg_id, y AS lat, x AS lon, alt FROM w WHERE y1 IS NULL   -- each leg's l
 """
 
 
+def write_stats(a, n_legs, layers, rstats, path, el):
+    """Sidecar next to the archive, not in tmp: tmp is deleted on success and
+    the per-level cell counts are the thing worth watching day over day."""
+    with open(path, "w") as f:
+        json.dump(dict(legs=n_legs, step_km=a.step_km,
+                       zoom_offset=a.zoom_offset, max_res=a.max_res,
+                       levels=[{k: v for k, v in l.items() if k != "path"}
+                               for l in layers],
+                       raster=rstats), f, indent=1)
+    print(f"{el()} stats: {path}")
+    return path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--points", required=True,
                    help="points_legs.parquet from build_legs.py")
-    p.add_argument("--out", required=True, help="output .pmtiles path")
+    p.add_argument("--out", default=None,
+                   help="vector hexbin .pmtiles path. OPTIONAL: omit it and only "
+                        "the raster is built, which skips the whole H3 roll-up "
+                        "(the raster reads the finest level and derives its own "
+                        "pyramid by halving the image) as well as tippecanoe")
     p.add_argument("--tmp", default=None, help="scratch dir (default <out>.tmp)")
     p.add_argument("--max-res", type=int, default=6,
                    help="finest H3 resolution (6 = 3.2 km edge, drawn at z8)")
     p.add_argument("--min-res", type=int, default=0)
     p.add_argument("--zoom-offset", type=int, default=2, help="zoom = res + this")
+    p.add_argument("--raster-out", default=None,
+                   help="raster overview .pmtiles path -- this is the archive a "
+                        "map should draw; see hex_raster.py for why")
+    p.add_argument("--raster-max-zoom", type=int, default=4,
+                   help="zoom the raster grid is built at; at 512px tiles z4 is "
+                        "4.9 km/px, which matches res 6")
+    p.add_argument("--raster-tile-size", type=int, default=512)
+    p.add_argument("--grid-out", default=None,
+                   help="also dump the raw density grid as a sparse .npz -- "
+                        "unnormalised, so a stack of days is comparable; this "
+                        "is what render_video.py consumes")
+    p.add_argument("--grid-zoom", type=int, default=2,
+                   help="zoom level to dump for --grid-out (default 2 = 2048px "
+                        "world, enough for 1080p)")
+    p.add_argument("--raster-gamma", type=float, default=2.0,
+                   help="ramp compression for the raster: alpha = (v/p99) ** "
+                        "(1/gamma). 1 = linear, which measured as leaving most "
+                        "of the network invisible; see hex_raster.py")
     p.add_argument("--step-km", type=float, default=1.5,
                    help="curve sample spacing; keep <= half the finest hex edge")
     p.add_argument("--max-sub", type=int, default=4096,
@@ -169,14 +218,18 @@ def main():
 
     if a.min_res > a.max_res:
         sys.exit("--min-res must be <= --max-res")
-    # fail before the aggregation, not after an hour of it
-    if not a.no_tiles:
+    if not a.out and not a.raster_out:
+        sys.exit("nothing to do: pass --raster-out and/or --out")
+    want_vector = a.out is not None
+    # fail before the aggregation, not after an hour of it -- and only when the
+    # vector archive is actually being built, since nothing else needs these
+    if want_vector and not a.no_tiles:
         for tool in ("tippecanoe", "tile-join"):
             if not shutil.which(tool):
                 sys.exit(f"{tool} not found on PATH. Build tippecanoe >= 2.17 "
                          f"(https://github.com/felt/tippecanoe), or rerun with "
                          f"--no-tiles to stop after the .geojsonl files.")
-    tmp = a.tmp or (a.out + ".tmp")
+    tmp = a.tmp or ((a.out or a.raster_out) + ".tmp")
     os.makedirs(tmp, exist_ok=True)
     t0 = time.time()
 
@@ -241,7 +294,10 @@ def main():
     # globally distinct and the final count is count(*), not count(DISTINCT).
     R = a.max_res
     con.execute(f"CREATE TABLE pair_{R} (cell UBIGINT, lid INTEGER)")
-    con.execute(f"CREATE TABLE alt_{R} (cell UBIGINT, asum DOUBLE, acnt BIGINT, amin INTEGER)")
+    # `a`/`amin` are vector feature properties; the raster carries density only
+    if want_vector:
+        con.execute(f"CREATE TABLE alt_{R} "
+                    f"(cell UBIGINT, asum DOUBLE, acnt BIGINT, amin INTEGER)")
     for b in range(a.buckets):
         con.execute(f"CREATE OR REPLACE TEMP VIEW s AS "
                     f"SELECT * FROM ("
@@ -253,23 +309,79 @@ def main():
             FROM s JOIN leg l USING (leg_id)
         """)
         con.execute(f"INSERT INTO pair_{R} SELECT DISTINCT cell, lid FROM cells")
-        con.execute(f"""
-            INSERT INTO alt_{R}
-            SELECT cell, sum(alt), count(*), min(alt)::INTEGER FROM cells GROUP BY cell
-        """)
+        if want_vector:
+            con.execute(f"""
+                INSERT INTO alt_{R}
+                SELECT cell, sum(alt), count(*), min(alt)::INTEGER
+                FROM cells GROUP BY cell
+            """)
         ns, np_ = con.execute("SELECT count(*) FROM cells").fetchone()[0], \
             con.execute(f"SELECT count(*) FROM pair_{R}").fetchone()[0]
         print(f"{el()} bucket {b+1}/{a.buckets}: {ns} samples -> {np_} pairs so far")
         con.execute("DROP TABLE cells")
 
     # buckets each aggregated altitude independently; merge the partials
-    con.execute(f"""
-        CREATE OR REPLACE TABLE alt_{R} AS
-        SELECT cell, sum(asum) AS asum, sum(acnt) AS acnt, min(amin) AS amin
-        FROM alt_{R} GROUP BY cell
-    """)
+    if want_vector:
+        con.execute(f"""
+            CREATE OR REPLACE TABLE alt_{R} AS
+            SELECT cell, sum(asum) AS asum, sum(acnt) AS acnt, min(amin) AS amin
+            FROM alt_{R} GROUP BY cell
+        """)
 
-    # ---- 3+4+5. Walk the pyramid finest-first, and finish each level completely
+    # The density accumulator, and the reason the coarse zooms read at all.
+    #
+    # `n` rolls up as a SET UNION -- distinct flights through the cell -- which is
+    # the honest answer to "how many flights crossed here" but grows with cell
+    # area, so every coarse cell converges on "lots" and the level saturates. On a
+    # real day, union-counting put western Europe's res-2 cells in the global top
+    # 2% with almost no spread left between them.
+    #
+    # `w` instead accumulates the SUM of the finest level's per-cell counts, which
+    # divided by the descendant count is an area-average: mean flights per
+    # finest-resolution cell. That is what a raster overview pyramid computes when
+    # it averages 2x2 pixels into their parent (Mapterhorn's downsampling stage
+    # does exactly this), and it is scale-invariant in the way a union-count
+    # cannot be -- so one linear ramp reads correctly at every zoom. Measured on
+    # the same day, it widens western Europe's own spread from 50%% to 65%% of the
+    # global range and moves its median off the ceiling.
+    if want_vector:
+        con.execute(f"""
+            CREATE OR REPLACE TABLE w_{R} AS
+            SELECT cell, count(*)::DOUBLE AS w FROM pair_{R} GROUP BY cell
+        """)
+
+    # ---- 3. The raster, off the FINEST level and nothing else. It derives its
+    # own pyramid by halving the image, so it never needs the H3 roll-up below --
+    # which is why --raster-out alone skips everything after this.
+    rstats = None
+    if a.raster_out:
+        import hex_raster
+        pts = con.execute(f"""
+            SELECT h3_cell_to_lat(cell) AS lat, h3_cell_to_lng(cell) AS lon,
+                   count(*)::DOUBLE AS n
+            FROM pair_{R} GROUP BY cell
+        """).fetchnumpy()
+        if len(pts["n"]):
+            rstats = hex_raster.build(
+                pts["lat"], pts["lon"], pts["n"], a.raster_out,
+                max_zoom=a.raster_max_zoom, tile_size=a.raster_tile_size,
+                gamma=a.raster_gamma,
+                grid_out=a.grid_out, grid_zoom=a.grid_zoom,
+                log=lambda m: print(f"{el()} {m}", flush=True))
+            print(f"{el()} raster DONE: {a.raster_out} "
+                  f"({os.path.getsize(a.raster_out)/1e6:.1f} MB)")
+        else:
+            print(f"{el()} raster: no cells, skipped")
+        del pts
+
+    if not want_vector:
+        write_stats(a, n_legs, [], rstats, a.raster_out + ".stats.json", el)
+        con.close()
+        if not a.keep_tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # ---- 4+5+6. Walk the pyramid finest-first, and finish each level completely
     # (aggregate -> geojsonl -> tiles -> free) before deriving the next. The
     # alternative -- build every level, then write every geojsonl, then tile --
     # holds all of it on disk at once, and at res 6 that is several GB more than
@@ -283,28 +395,49 @@ def main():
         # z2 renders NOTHING from z0 to z1.9, which is exactly the globe view
         # this layer exists for. 21 extra tiles buys that back.
         z_lo = 0 if r == a.min_res else z
+        # 7 children per cell per level (6 under the 12 pentagons, which is a
+        # rounding error at this scale), so this is the descendant count that
+        # turns the accumulated w back into a per-finest-cell average. Counting
+        # missing descendants as zero is the point: a parent holding one busy
+        # child and six empty ones is not as dense as one busy throughout.
+        descendants = 7 ** (R - r)
         con.execute(f"""
             CREATE OR REPLACE TABLE agg_{r} AS
             SELECT p.cell AS cell, count(*)::BIGINT AS n,
-                   round(al.asum / al.acnt)::INTEGER AS a, al.amin AS amin
-            FROM pair_{r} p JOIN alt_{r} al USING (cell)
-            GROUP BY p.cell, al.asum, al.acnt, al.amin
+                   max(w.w) / {descendants}::DOUBLE AS dens,
+                   round(max(al.asum) / max(al.acnt))::INTEGER AS a,
+                   max(al.amin) AS amin
+            FROM pair_{r} p JOIN alt_{r} al USING (cell) JOIN w_{r} w USING (cell)
+            GROUP BY p.cell
         """)
-        ncell, nmax, p99 = con.execute(f"""
-            SELECT count(*), max(n), coalesce(quantile_cont(n, 0.99), 1) FROM agg_{r}
+        ncell, nmax, nmed, dp99, dmax = con.execute(f"""
+            SELECT count(*), max(n), coalesce(median(n), 1),
+                   coalesce(quantile_cont(dens, 0.99), 1), coalesce(max(dens), 1)
+            FROM agg_{r}
         """).fetchone()
+
         if ncell:
-            p99 = max(float(p99), 1.0)
+            dp99 = max(float(dp99), 1e-9)
             gj = os.path.join(tmp, f"res{r}.geojsonl")
-            # d = log-normalised 1..255 against THIS resolution's p99, so one
-            # client opacity ramp reads correctly at every zoom.
+            # dn = dens on a LINEAR 0-255 ramp against this resolution's p99.
+            #
+            # Linear, not log and not a percentile rank. Both of those were tried
+            # against a real day and both flattened the busy regions: they spend
+            # the range making the empty 90%% of the planet visible, which leaves
+            # nothing for the corridors. Linear on an area-average keeps the
+            # contrast where the traffic is, at the cost of central Africa reading
+            # as genuinely near-empty -- which it is, at ~100x less traffic. That
+            # is an editorial choice and this is the honest side of it.
+            #
+            # Clipped at the p99 rather than the max so a handful of extreme cells
+            # (a single airport can be 10x its own neighbourhood) don't compress
+            # everything else into the bottom of the ramp.
+            dexpr = f"least(255, round(255 * dens / {dp99}::DOUBLE))"
             con.execute(f"""
                 COPY (
                   WITH g AS (
-                    SELECT n, a, amin,
-                           least(255, greatest(1, round(
-                               255 * ln(1 + n) / ln(1 + {p99}::DOUBLE)
-                           )))::INTEGER AS d,
+                    SELECT n, round(dens, 2) AS dens, a, amin,
+                           {dexpr}::INTEGER AS dn,
                            list_transform(h3_cell_to_vertexes(cell),
                                v -> [h3_vertex_to_lng(v), h3_vertex_to_lat(v)]) AS ring
                     FROM agg_{r}
@@ -312,7 +445,7 @@ def main():
                     -- unwrap each ring relative to its first vertex so an
                     -- antimeridian cell stays a small polygon instead of
                     -- smearing right across the globe
-                    SELECT n, a, amin, d, list_transform(ring, q ->
+                    SELECT n, dens, a, amin, dn, list_transform(ring, q ->
                         [CASE WHEN q[1] - ring[1][1] >  180 THEN q[1] - 360
                               WHEN q[1] - ring[1][1] < -180 THEN q[1] + 360
                               ELSE q[1] END, q[2]]) AS ring
@@ -320,7 +453,7 @@ def main():
                   ), s AS (
                     -- a cell now poking past +-180 is emitted twice, shifted, so
                     -- tippecanoe clips each copy to the world and both halves draw
-                    SELECT n, a, amin, d, ring, unnest(
+                    SELECT n, dens, a, amin, dn, ring, unnest(
                         CASE WHEN list_max(list_transform(ring, q -> q[1])) >  180
                                   THEN [0.0, -360.0]
                              WHEN list_min(list_transform(ring, q -> q[1])) < -180
@@ -328,7 +461,8 @@ def main():
                              ELSE [0.0] END) AS sh
                     FROM u
                   )
-                  SELECT '{{"type":"Feature","properties":{{"n":' || n || ',"d":' || d
+                  SELECT '{{"type":"Feature","properties":{{"n":' || n
+                      || ',"dens":' || dens || ',"dn":' || dn
                       || ',"a":' || a || ',"amin":' || amin
                       || '}},"geometry":{{"type":"Polygon","coordinates":[['
                       || array_to_string(list_transform(ring,
@@ -340,10 +474,14 @@ def main():
                 ) TO '{gj}' (FORMAT csv, HEADER false, DELIMITER E'\\x1f', QUOTE E'\\x01')
             """)
             zlabel = f"z{z}" if z_lo == z else f"z{z_lo}-{z}"
-            print(f"{el()} res {r} -> {zlabel}: {ncell} cells, max {nmax} flights, "
-                  f"p99 {p99:.0f}  ({os.path.getsize(gj)/1e6:.1f} MB geojsonl)")
+            print(f"{el()} res {r} -> {zlabel}: {ncell} cells, "
+                  f"median {nmed:.0f} / max {nmax} flights, "
+                  f"dens p99 {dp99:.1f} / max {dmax:.1f}"
+                  f"  ({os.path.getsize(gj)/1e6:.1f} MB geojsonl)")
             lay = dict(res=r, zoom=z, zoom_lo=z_lo, cells=ncell,
-                       nmax=nmax, p99=p99)
+                       nmax=nmax, nmedian=float(nmed),
+                       dens_p99=float(dp99), dens_max=float(dmax),
+                       dn="linear(dens / dens_p99)")
             if a.no_tiles:
                 lay["path"] = gj
             else:
@@ -377,17 +515,19 @@ def main():
                        sum(asum) AS asum, sum(acnt) AS acnt, min(amin) AS amin
                 FROM alt_{r} GROUP BY 1
             """)
-        for tbl in (f"pair_{r}", f"alt_{r}", f"agg_{r}"):
+            # SUM, deliberately -- w is an accumulated total that only becomes an
+            # average when divided by the descendant count above. Averaging here
+            # instead would silently drop the empty descendants from the divisor.
+            con.execute(f"""
+                CREATE TABLE w_{r-1} AS
+                SELECT h3_cell_to_parent(cell, {r-1}) AS cell, sum(w) AS w
+                FROM w_{r} GROUP BY 1
+            """)
+        for tbl in (f"pair_{r}", f"alt_{r}", f"agg_{r}", f"w_{r}"):
             con.execute(f"DROP TABLE IF EXISTS {tbl}")
 
     layers.reverse()                        # coarsest first, for tile-join
-    # next to the archive, not in tmp -- tmp is deleted on success, and the
-    # per-level cell counts are the thing worth watching day over day
-    stats = a.out + ".stats.json"
-    with open(stats, "w") as f:
-        json.dump(dict(legs=n_legs, step_km=a.step_km, zoom_offset=a.zoom_offset,
-                       levels=[{k: v for k, v in l.items() if k != "path"}
-                               for l in layers]), f, indent=1)
+    stats = write_stats(a, n_legs, layers, rstats, a.out + ".stats.json", el)
     con.close()
 
     if a.no_tiles:
