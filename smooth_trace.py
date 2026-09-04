@@ -25,7 +25,7 @@ Usage:
     ./smooth_trace.py subset_ebbr/traces --out subset_smooth [--ground-elevation]
     ./smooth_trace.py path/to/trace_full_XXXX.json --dump      # print one track
 """
-import argparse, glob, math, os, sys
+import argparse, math, os, sys
 import numpy as np
 import importlib.util
 

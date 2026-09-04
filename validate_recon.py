@@ -7,7 +7,7 @@ its distance from the RAW points against the graduated tolerance (2 m ground ->
 150 m cruise). If reconstruction stays within tolerance, the nodes alone are
 enough to draw the track.
 """
-import argparse, glob, math, os, sys
+import argparse, math, os, sys
 import importlib.util
 import numpy as np
 

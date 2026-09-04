@@ -19,7 +19,7 @@ Pipeline:
 Usage:  ./build_legs.py [--limit-aircraft N] [--traces PATH] [--meta PATH]
                         [--airports CSV] [--out-dir DIR]
 """
-import argparse, math, os, statistics, csv as csvmod
+import argparse, math, os, csv as csvmod
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
