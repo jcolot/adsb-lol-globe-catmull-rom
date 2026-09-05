@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Daily ADS-B trace pipeline, split into phases so each can run as its own CI step:
-#   resolve  -> find the latest adsblol release tag for the variant
+#   resolve  -> find the adsblol release tag for the variant (SRC_DATE, else latest)
 #   fetch    -> stream the split-tar assets straight into tar (no 4-6 GB staged)
 #   fit      -> fit sparse Catmull-Rom spline nodes (fit_spline.py)
 #   legs     -> split into per-airport leg partitions (build_legs.py)

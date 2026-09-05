@@ -24,7 +24,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # hexes + bundle were added after the 120 the fetch/fit/legs run was
+    # sized for; that run took ~1h15m, so give the two extra phases room
+    # rather than have the first nightly hit the ceiling.
+    timeout-minutes: 240
     env:
       GH_TOKEN: ${{ github.token }}
       VARIANT: prod-0
@@ -61,20 +64,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           sudo apt-get update -qq
-          sudo apt-get install -y -qq rclone build-essential libsqlite3-dev zlib1g-dev
+          sudo apt-get install -y -qq rclone
 
-      # tippecanoe isn't packaged for ubuntu-latest; ~1 min from source, cached
-      # by ref so subsequent runs just restore the binaries.
+      # Only the vector hexbin archive needs tippecanoe, and HEX_VECTOR is empty,
+      # so these three steps are skipped on a normal run. They stay wired up so
+      # setting HEX_VECTOR is the only thing needed to get that archive back.
       - name: Cache tippecanoe
+        if: env.HEX_VECTOR != ''
         id: tippecanoe-cache
         uses: actions/cache@v4
         with:
           path: ~/.local/bin
           key: tippecanoe-${{ env.TIPPECANOE_REF }}-${{ runner.os }}
 
+      # not packaged for ubuntu-latest; ~1 min from source, cached by ref
       - name: Build tippecanoe
-        if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
+        if: env.HEX_VECTOR != '' && steps.tippecanoe-cache.outputs.cache-hit != 'true'
         run: |
+          sudo apt-get install -y -qq build-essential libsqlite3-dev zlib1g-dev
           git clone --depth 1 -b "$TIPPECANOE_REF" https://github.com/felt/tippecanoe /tmp/tippecanoe
           make -j"$(nproc)" -C /tmp/tippecanoe
           mkdir -p ~/.local/bin
@@ -82,10 +89,11 @@ jobs:
              /tmp/tippecanoe/tile-join ~/.local/bin/
 
       - name: Put tippecanoe on PATH
+        if: env.HEX_VECTOR != ''
         run: |
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Resolve latest release
+      - name: Resolve release (SRC_DATE, else latest)
         run: bash run_pipeline.sh resolve
 
       - name: Download + extract traces
