@@ -16,6 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO="${SRC_REPO:-adsblol/globe_history_2026}"
 VARIANT="${VARIANT:-prod-0}"            # prod-0 (ADS-B) | mlatonly-0 | staging-0
+SRC_DATE="${SRC_DATE:-}"                # YYYY-MM-DD to backfill; empty = latest
 WORK="${WORK:-$SCRIPT_DIR/work}"
 OUT="${OUT:-$SCRIPT_DIR/out}"
 R2_PREFIX="${R2_PREFIX:-legs}"
@@ -41,11 +42,26 @@ TAGFILE="$WORK/TAG"
 
 resolve() {
     mkdir -p "$WORK"
-    # Releases are newest-first, so the first page holds the latest of every
-    # variant -- do NOT --paginate (that applies --jq per page -> one tag per page).
     local tag
-    tag="$(gh api "repos/$REPO/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name | endswith(\"-planes-readsb-$VARIANT\"))][0].tag_name")"
+    if [ -n "$SRC_DATE" ]; then
+        # tags carry the data date: v2026.07.23-....-planes-readsb-prod-0
+        local pfx="v${SRC_DATE//-/.}"
+        # --paginate IS safe here: the filter streams every match rather than
+        # indexing into a per-page array. Take the first line by expansion, NOT
+        # `| head -1` -- head would close the pipe mid-pagination and SIGPIPE gh
+        # into a pipefail exit.
+        tag="$(gh api "repos/$REPO/releases?per_page=100" --paginate \
+                --jq ".[] | select(.tag_name | startswith(\"$pfx\"))
+                          | select(.tag_name | endswith(\"-planes-readsb-$VARIANT\"))
+                          | .tag_name")"
+        tag="${tag%%$'\n'*}"
+        [ -n "$tag" ] || { echo "no $VARIANT release for $SRC_DATE"; exit 1; }
+    else
+        # Releases are newest-first, so the first page holds the latest of every
+        # variant -- do NOT --paginate (that applies --jq per page -> one tag per page).
+        tag="$(gh api "repos/$REPO/releases?per_page=100" \
+                --jq "[.[] | select(.tag_name | endswith(\"-planes-readsb-$VARIANT\"))][0].tag_name")"
+    fi
     [ -n "$tag" ] && [ "$(printf '%s' "$tag" | wc -l)" -eq 0 ] \
         || { echo "bad/empty $VARIANT tag: '$tag'"; exit 1; }
     echo "$tag" >"$TAGFILE"

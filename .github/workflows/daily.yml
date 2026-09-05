@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "0 4 * * *"   # 04:00 UTC — after the ~03:26 UTC prod-0 release drops
   workflow_dispatch:       # allow manual runs from the Actions tab
+    inputs:
+      date:
+        description: "Data date to process, YYYY-MM-DD (empty = latest release)"
+        required: false
+        default: ""
+      retention_days:
+        description: "Keep the newest N date partitions in R2"
+        required: false
+        default: "30"
 
 permissions:
   contents: read           # gh needs only read access to the (public) source repo
@@ -21,10 +30,17 @@ jobs:
       VARIANT: prod-0
       R2_BUCKET: ${{ vars.R2_BUCKET }}
       R2_PREFIX: legs
-      RETENTION_DAYS: "30"   # keep the newest N date partitions; older are pruned
-      TIPPECANOE_REF: "2.72.0"
-      HEX_MEMORY: "12GB"     # runner has 16 GB; leave headroom for tippecanoe
+      SRC_DATE: ${{ inputs.date }}
+      # A backfill of an OLD day must raise this, or the prune step deletes the
+      # very partition the run just uploaded (it keeps the newest N by date).
+      RETENTION_DAYS: ${{ inputs.retention_days || '30' }}
+      HEX_MEMORY: "12GB"     # runner has 16 GB; leave the OS and spill room
       BUNDLE_MEMORY: "12GB"
+      # The vector hexbin archive is off: nothing draws it and it cost 115 MB a
+      # day against the raster's 8. Setting this also switches the tippecanoe
+      # build steps on, which are skipped entirely while it is empty.
+      HEX_VECTOR: ""
+      TIPPECANOE_REF: "2.72.0"
       # rclone S3 remote "r2" assembled entirely from env (no config file)
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
