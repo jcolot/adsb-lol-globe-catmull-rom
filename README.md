@@ -409,6 +409,51 @@ The floor cost is the ~4 GB/day download, which no shortcut removes: about
 locally — where a targeted window of 30–60 days (120–240 GB, and near-zero disk
 because nothing is staged) is the practical option.
 
+### Doing it on Actions instead of locally
+
+Two workflows split the work along its natural seam, because the two halves are
+nothing alike. Colour is the LAST step, so re-rendering is ~30 ms a frame; only
+building the grids costs anything.
+
+`backfill-grids.yml` — the expensive half. `workflow_dispatch` with `start`,
+`end`, `days_per_job`, `grid_zoom`, `gap_mode`. A `plan` job resolves every
+`prod-0` release once (60-odd jobs each paginating the API would get
+rate-limited) and drops days with no release upstream — 2026-05-06 has none.
+Each `build` job streams `days_per_job` days concurrently through
+`build_grid.py --tar-stream`; the runner has 4 cores and the build is
+single-threaded, so 4 is the natural batch. At `max-parallel: 20` the 245 days
+of 2026 take roughly half an hour of wall clock.
+
+Grids come back as an **artifact**, not via R2, for two reasons: the `grids/`
+prefix in R2 currently returns `AccessDenied`, and 245 jobs is the wrong place
+to discover a credential problem; and artifacts are free on a public repo, where
+245 × 1.5 MB is ~370 MB. `collect` merges them into one `grids-all` download.
+
+`render.yml` — the cheap half, seconds of compute. Takes `mode`, `palette`,
+`start`, `end`, `smooth`, `min_day_frac`, an `extra_args` escape hatch, and
+either a `grids_run_id` to pull a backfill run's artifact or nothing, in which
+case it fetches the grids from R2. It writes the frames, the mp4 and
+`ranking.csv` as an artifact and puts the shot list in the run summary. Run the
+backfill once, then run this as often as you like.
+
+Both route dispatch inputs through `env:` rather than interpolating them into
+`run:` blocks, so a crafted input cannot inject shell.
+
+The floor cost is the download, which no shortcut removes — but on Actions the
+release assets never leave GitHub's own network, so a year is free and fast
+there while being the binding constraint locally.
+
+**Render memory.** The stack is held whole, so a 245-day run at `--grid-zoom 2`
+is 3.8 GB, and `rolling_mean` and `trailing_baseline` each need a second array
+of the same shape: ~7.7 GB peak against a runner's 16 GB. Those two used to
+build a float64 cumulative sum over the whole stack — and because
+`np.concatenate` holds both its input and its result, that was 15.4 GB of
+float64 on top of the stack, or 23 GB total, which simply did not run. They now
+slide a running total instead, which is bit-identical and needs one
+`(side, side)` accumulator. If a longer span ever runs out of memory, build the
+grids at `--grid-zoom 1` (1024 px, a quarter of it) rather than trimming the
+render.
+
 ### Crossing a coverage gap
 
 adsb.lol is fed by volunteer ground receivers, so large parts of the world are
