@@ -149,19 +149,6 @@ upload() {
         --exclude 'points_legs.parquet' --exclude 'traffic-grid.npz' \
         --checksum --transfers 16 --fast-list --stats-one-line
 
-    # The raw density grid goes to its own prefix, NOT into date=$date, because
-    # the prune below only ever walks date= partitions -- so the grids survive
-    # retention. That is the point of them: they are the only per-day artifact
-    # that is comparable ACROSS days (the raster's alpha is normalised per day),
-    # so a multi-year animation has to be able to reach back past retention.
-    # At ~2 MB/day this is 0.7 GB/year, which is noise against the 30-day
-    # working set. See render_video.py.
-    if [ -f "$OUT/legs/traffic-grid.npz" ]; then
-        rclone copyto "$OUT/legs/traffic-grid.npz" "$base/grids/$date.npz" \
-            --checksum --stats-one-line
-        echo "grid kept beyond retention: $base/grids/$date.npz"
-    fi
-
     # prune to the newest $keep date partitions
     mapfile -t dates < <(rclone lsf --dirs-only "$base/" | sed 's#/$##' | grep '^date=' | sort)
     local total=${#dates[@]}
@@ -177,6 +164,40 @@ upload() {
     python3 -c "import json,sys; d=sys.argv[1:]; print(json.dumps({'dates':d,'latest':d[-1] if d else None}))" \
         "${kept[@]}" > "$WORK/dates.json"
     rclone copyto "$WORK/dates.json" "$base/dates.json"
+    # The raw density grid goes to its own prefix, NOT into date=$date, because
+    # the prune only ever walks date= partitions -- so the grids survive
+    # retention. That is the point of them: they are the only per-day artifact
+    # comparable ACROSS days (the raster's alpha is normalised per day), so a
+    # multi-year animation has to reach back past retention. ~2 MB/day.
+    #
+    # DELIBERATELY LAST, AND NON-FATAL. When this ran before the prune and the
+    # manifest, an AccessDenied on this one 2 MB object aborted the step under
+    # `set -e` -- so dates.json was never rebuilt and retention never applied,
+    # and the frontend sat two days stale while the partitions it wanted were
+    # already in the bucket, uploaded and unreachable. A grid we cannot write is
+    # a missing frame in a future animation; a manifest we cannot write is a
+    # broken site today. Never let the first break the second again.
+    if [ -f "$OUT/legs/traffic-grid.npz" ]; then
+        if rclone copyto "$OUT/legs/traffic-grid.npz" "$base/grids/$date.npz" \
+               --stats-one-line; then
+            echo "grid kept beyond retention: $base/grids/$date.npz"
+        else
+            echo "WARNING: could not upload $base/grids/$date.npz" >&2
+            echo "  date=$date is complete; only the cross-day grid is missing." >&2
+            # Distinguish a credential/scope problem from anything else without
+            # dumping headers (these logs are public). If the prefix will not
+            # even list, the R2 token does not reach outside date=*.
+            if rclone lsf "$base/grids/" >/dev/null 2>&1; then
+                echo "  the grids/ prefix lists fine, so this is not token scope" >&2
+            else
+                echo "  the grids/ prefix does not list either -- the R2 token" >&2
+                echo "  probably has no access outside the date= partitions" >&2
+            fi
+            [ -n "${GITHUB_ACTIONS:-}" ] && \
+                echo "::warning title=Grid upload failed::$date.npz was not written to $base/grids/ - the day partition is fine, but render_video will have a hole here"
+        fi
+    fi
+
     echo "DONE: $tag -> $base/date=$date  (kept ${#kept[@]} day(s), retention $keep)"
 }
 
