@@ -1,0 +1,165 @@
+name: render
+
+# Turn a stack of daily grids into frames and an mp4, and hand it back as an
+# artifact. This is the CHEAP half: colour is the last step, so a re-render at
+# a different palette is ~30 ms per frame plus the encode -- seconds for a
+# year. Only building the grids is expensive, and backfill-grids.yml does that.
+#
+# So: run backfill-grids once, then run this as often as you like against the
+# same grids to try palettes, modes and date ranges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      grids_run_id:
+        description: "Run ID of a backfill-grids run to take the grids from (empty = pull them from R2)"
+        required: false
+        default: ""
+      mode:
+        description: "absolute (one fixed divisor, shows the cycle) | anomaly (vs trailing baseline, shows events)"
+        required: true
+        default: "anomaly"
+        type: choice
+        options: ["anomaly", "absolute"]
+      palette:
+        description: "absolute: inferno | amber | ice.  anomaly: cyan-orange | blue-red.  empty = the mode's default"
+        required: false
+        default: ""
+      start:
+        description: "First day to render, YYYY-MM-DD (empty = all available)"
+        required: false
+        default: ""
+      end:
+        description: "Last day to render, YYYY-MM-DD (empty = all available)"
+        required: false
+        default: ""
+      smooth:
+        description: "Centred rolling-mean window in days; 1 disables it. Below 7 the weekday cycle shows"
+        required: false
+        default: "7"
+      min_day_frac:
+        description: "Drop days below this fraction of the local median; 0 keeps every day"
+        required: false
+        default: "0.85"
+      extra_args:
+        description: "Anything else to pass to render_video.py, e.g. --anomaly-clip 3 --no-coverage-fix"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.actor }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ACL: private
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # ffmpeg is not guaranteed on the runner image, and render_video only
+          # writes the PNGs without it.
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg rclone
+
+      - name: Take grids from a backfill run
+        if: inputs.grids_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: grids-all
+          run-id: ${{ inputs.grids_run_id }}
+          github-token: ${{ github.token }}
+          path: grids
+
+      - name: Or pull them from R2
+        if: inputs.grids_run_id == ''
+        run: |
+          set -euo pipefail
+          : "${R2_BUCKET:?set the R2_BUCKET repository variable, or pass grids_run_id}"
+          mkdir -p grids
+          rclone copy "r2:$R2_BUCKET/${R2_PREFIX:-legs}/grids" grids \
+            --include '*.npz' --transfers 16 --stats-one-line
+        env:
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PREFIX: legs
+
+      - name: Render
+        env:
+          MODE: ${{ inputs.mode }}
+          PALETTE: ${{ inputs.palette }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          SMOOTH: ${{ inputs.smooth }}
+          MIN_DAY_FRAC: ${{ inputs.min_day_frac }}
+          # Deliberately an escape hatch, and deliberately via env: reaching
+          # render_video's rarer flags without interpolating a dispatch input
+          # into the script text. Unquoted below so it word-splits, which is
+          # the point, but it cannot inject shell.
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          set -euo pipefail
+          n=$(ls grids/*.npz 2>/dev/null | wc -l)
+          [ "$n" -gt 0 ] || { echo "no grids found -- pass grids_run_id, or fix the R2 grids/ prefix"; exit 1; }
+          echo "$n day(s) of grids, $(du -sh grids | cut -f1)"
+          # A 245-day 2048px stack peaks around 7.7 GB after the sliding-sum
+          # rewrite of rolling_mean/trailing_baseline; the runner has 16 GB.
+          # If a much longer span ever OOMs here, build the grids at
+          # --grid-zoom 1 instead of trying to trim the render.
+          python3 render_video.py \
+            --grids grids --out-dir out \
+            --mode "$MODE" \
+            --smooth "$SMOOTH" \
+            --min-day-frac "$MIN_DAY_FRAC" \
+            ${PALETTE:+--palette "$PALETTE"} \
+            ${START:+--start "$START"} \
+            ${END:+--end "$END"} \
+            $EXTRA_ARGS
+          ls -l out/ | head -5
+          echo "frames: $(ls out/f*.png | wc -l)"
+
+      - name: Summarise
+        env:
+          MODE: ${{ inputs.mode }}
+          PALETTE: ${{ inputs.palette }}
+        run: |
+          {
+            echo "### render: $MODE $PALETTE"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| days of grids | $(ls grids/*.npz | wc -l) |"
+            echo "| frames | $(ls out/f*.png | wc -l) |"
+            echo "| video | $(ls -sh out/*.mp4 2>/dev/null | awk '{print $1}' || echo 'none — ffmpeg missing') |"
+            echo
+            echo "Top regional anomalies (the shot list):"
+            echo '```'
+            head -11 out/ranking.csv 2>/dev/null || echo "no ranking.csv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ inputs.mode }}${{ inputs.palette && format('-{0}', inputs.palette) || '' }}
+          path: |
+            out/*.mp4
+            out/ranking.csv
+            out/f*.png
+          retention-days: 30
+          if-no-files-found: error

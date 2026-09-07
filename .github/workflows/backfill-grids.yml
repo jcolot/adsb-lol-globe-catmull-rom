@@ -1,0 +1,238 @@
+name: backfill-grids
+
+# Build one traffic-grid npz per day, for a span of past days, in parallel.
+#
+# This exists because the grids are the only per-day artifact comparable ACROSS
+# days (the raster's alpha is normalised per day), so an animation over months
+# needs them for every day -- including days long past R2 retention, which the
+# nightly never produced. Measured cost per day: ~5.1 min of ONE core, and
+# ~3.9 GB streamed. 245 days is ~21 h serially, which is why this fans out.
+#
+# Output is a workflow ARTIFACT, not R2, deliberately: the grids/ prefix in R2
+# is currently returning AccessDenied, and 245 jobs is the wrong place to
+# discover a credential problem. Artifacts are free on a public repo and
+# 245 x 1.5 MB is ~370 MB, well inside the limits.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First data date, YYYY-MM-DD"
+        required: true
+      end:
+        description: "Last data date, YYYY-MM-DD (inclusive)"
+        required: true
+      days_per_job:
+        description: "Days each runner handles; it has 4 cores and the build is single-threaded"
+        required: false
+        default: "4"
+      grid_zoom:
+        description: "2 = 2048px (matches the nightly), 1 = 1024px (a quarter of the render memory)"
+        required: false
+        default: "2"
+      gap_mode:
+        description: "best | band | arc -- how a coverage gap is crossed"
+        required: false
+        default: "best"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-grids
+  cancel-in-progress: false
+
+jobs:
+  # Resolve every release ONCE. 60-odd build jobs each paginating the releases
+  # API would be both slow and a good way to get rate-limited, and a day with
+  # no release at all (2026-05-06 is missing upstream) has to be dropped here
+  # rather than failing a job later.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      batches: ${{ steps.plan.outputs.batches }}
+      count: ${{ steps.plan.outputs.count }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve releases and split into batches
+        id: plan
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          DAYS_PER_JOB: ${{ inputs.days_per_job }}
+        run: |
+          python3 - <<'PY'
+          import datetime as dt, json, os, subprocess, sys
+
+          start = dt.date.fromisoformat(os.environ["START"])
+          end = dt.date.fromisoformat(os.environ["END"])
+          per = max(1, int(os.environ["DAYS_PER_JOB"]))
+          if end < start:
+              sys.exit("end is before start")
+
+          # adsblol opens a repo per year, but the boundary overlaps in BOTH
+          # directions: globe_history_2026 holds 2025-12-18 onward, and
+          # globe_history_2025 stops at 2025-12-30 -- so 2025-12-31 lives only
+          # in the 2026 repo. Query year AND year+1 for every year in range,
+          # or a span inside late December silently reports days as missing.
+          span = {(start + dt.timedelta(days=k)).year
+                  for k in range((end - start).days + 1)}
+          years = span | {y + 1 for y in span}
+          assets = {}
+          for y in sorted(years):
+              repo = f"adsblol/globe_history_{y}"
+              out = subprocess.run(
+                  ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100",
+                   "--jq", '.[] | select(.tag_name | endswith("-planes-readsb-prod-0"))'
+                           ' | [.tag_name, ([.assets[].browser_download_url] | sort | join(" "))]'
+                           ' | @tsv'],
+                  capture_output=True, text=True)
+              if out.returncode != 0:
+                  print(f"  {repo}: {out.stderr.strip()[:200]}")
+                  continue
+              for line in out.stdout.splitlines():
+                  if not line.strip():
+                      continue
+                  tag, urls = line.split("\t", 1)
+                  date = tag[1:11].replace(".", "-")
+                  assets.setdefault(date, urls.split())
+
+          days, missing = [], []
+          d = start
+          while d <= end:
+              k = d.isoformat()
+              (days if k in assets else missing).append(k)
+              d += dt.timedelta(days=1)
+
+          plan = {k: assets[k] for k in days}
+          with open("plan.json", "w") as f:
+              json.dump(plan, f, indent=1)
+
+          batches = [list(range(i, min(i + per, len(days))))
+                     for i in range(0, len(days), per)]
+          ids = list(range(len(batches)))
+          with open("batches.json", "w") as f:
+              json.dump({str(i): [days[j] for j in b]
+                         for i, b in zip(ids, batches)}, f, indent=1)
+
+          print(f"{len(days)} days with a prod-0 release, {len(batches)} batches of <= {per}")
+          if missing:
+              print(f"NO RELEASE for {len(missing)} day(s), skipped: {', '.join(missing)}")
+          if len(batches) > 256:
+              sys.exit(f"{len(batches)} batches exceeds the 256-job matrix limit; "
+                       f"raise days_per_job to at least {-(-len(days) // 256)}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"batches={json.dumps(ids)}\n")
+              f.write(f"count={len(days)}\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            plan.json
+            batches.json
+          retention-days: 7
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # 20 is the free-plan concurrent-job ceiling; it is also plenty polite to
+      # the release CDN at ~4 streams per runner.
+      max-parallel: 20
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.batches) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+
+      - name: Build the batch
+        env:
+          BATCH: ${{ matrix.batch }}
+          GRID_ZOOM: ${{ inputs.grid_zoom }}
+          GAP_MODE: ${{ inputs.gap_mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p grids
+          # grep -v drops the blank line an empty list would produce, which
+          # would otherwise slip past the guard as one empty "date".
+          mapfile -t dates < <(python3 -c "import json,os;print('\n'.join(json.load(open('batches.json'))[os.environ['BATCH']]))" | grep -v '^$' || true)
+          [ "${#dates[@]}" -gt 0 ] || { echo "batch $BATCH resolved to no dates"; exit 1; }
+          echo "batch $BATCH: ${dates[*]}"
+          pids=()
+          for d in "${dates[@]}"; do
+            (
+              set -eo pipefail
+              mapfile -t urls < <(python3 -c "import json;print('\n'.join(json.load(open('plan.json'))['$d']))")
+              # --tar-stream keeps the 3.9 GB off the runner's small disk, and
+              # overlaps the download with the parse so only the CPU is billed.
+              curl -fsSL --retry 5 --retry-all-errors "${urls[@]}" \
+                | python3 build_grid.py --tar-stream \
+                    --out "grids/$d.npz" \
+                    --grid-zoom "$GRID_ZOOM" \
+                    --gap-mode "$GAP_MODE" >"grids/$d.log" 2>&1
+            ) &
+            pids+=("$!")
+          done
+          rc=0
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          for d in "${dates[@]}"; do
+            echo "--- $d ---"; tail -2 "grids/$d.log" || true
+          done
+          rm -f grids/*.log
+          ls -l grids/
+          exit "$rc"
+
+      # always(): a batch where ONE day failed still exits non-zero, and the
+      # default would skip this step and throw away the days that did build.
+      # The job still goes red, fail-fast is off, and collect reports the
+      # shortfall -- so a partial batch costs one day, not four.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grids-${{ matrix.batch }}
+          path: grids/*.npz
+          retention-days: 90
+          if-no-files-found: warn
+
+  # One artifact to download instead of 62.
+  collect:
+    needs: [plan, build]
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: grids-*
+          merge-multiple: true
+          path: grids
+      - name: Report
+        run: |
+          n=$(ls grids/*.npz 2>/dev/null | wc -l)
+          echo "collected $n of ${{ needs.plan.outputs.count }} day(s), $(du -sh grids | cut -f1)"
+          [ "$n" -gt 0 ] || { echo "no grids produced"; exit 1; }
+          if [ "$n" -ne "${{ needs.plan.outputs.count }}" ]; then
+            echo "::warning title=Incomplete backfill::$n of ${{ needs.plan.outputs.count }} days produced a grid; check which build jobs failed before rendering"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grids-all
+          path: grids/*.npz
+          retention-days: 90
