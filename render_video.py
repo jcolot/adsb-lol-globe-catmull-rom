@@ -331,17 +331,29 @@ def partial_days(dates, stack, frac, win=29):
 
 def rolling_mean(stack, win):
     """Centred rolling mean over axis 0, shrinking the window at the edges so
-    the first and last frames are not darkened by padding that isn't there."""
+    the first and last frames are not darkened by padding that isn't there.
+
+    Uses a sliding sum rather than a cumulative one. The cumsum this replaces
+    was correct but allocated a float64 copy of the WHOLE stack -- 7.7 GB for
+    245 days at 2048px, which put a year-long render over 16 GB and so out of
+    reach of both a CI runner and an ordinary laptop. A running total needs one
+    (side, side) accumulator instead, and `stack` is only ever read, so there is
+    no aliasing between input and result.
+    """
     if win <= 1:
         return stack
     n = len(stack)
     half = win // 2
-    cs = np.concatenate([np.zeros((1,) + stack.shape[1:], np.float64),
-                         np.cumsum(stack, axis=0, dtype=np.float64)])
     out = np.empty_like(stack)
+    acc = np.zeros(stack.shape[1:], np.float64)
+    a = b = 0                                  # summed so far: stack[a:b]
     for i in range(n):
-        a, b = max(0, i - half), min(n, i + half + 1)
-        out[i] = ((cs[b] - cs[a]) / (b - a)).astype(np.float32)
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        while b < hi:
+            acc += stack[b]; b += 1
+        while a < lo:
+            acc -= stack[a]; a += 1
+        out[i] = (acc / (hi - lo)).astype(stack.dtype)
     return out
 
 
@@ -369,13 +381,17 @@ def trailing_baseline(stack, win):
     exists). Trailing, not centred: a centred baseline would let an event leak
     backwards and blunt its own onset."""
     n = len(stack)
-    cs = np.concatenate([np.zeros((1,) + stack.shape[1:], np.float64),
-                         np.cumsum(stack, axis=0, dtype=np.float64)])
-    out = np.empty_like(stack)
+    out = np.empty_like(stack)              # never `stack` itself: anomaly mode
+    acc = np.zeros(stack.shape[1:], np.float64)   # divides one BY the other
+    a = b = 0                                     # summed so far: stack[a:b]
     for i in range(n):
-        a = max(0, i - win)
-        b = max(a + 1, i)
-        out[i] = ((cs[b] - cs[a]) / (b - a)).astype(np.float32)
+        lo = max(0, i - win)
+        hi = max(lo + 1, i)
+        while b < hi:
+            acc += stack[b]; b += 1
+        while a < lo:
+            acc -= stack[a]; a += 1
+        out[i] = (acc / (hi - lo)).astype(stack.dtype)
     return out
 
 
