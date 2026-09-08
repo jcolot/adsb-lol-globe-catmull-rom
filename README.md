@@ -663,6 +663,101 @@ What the bundle uniquely buys, then, is not the airport fan but the queries the
 partitions can't answer at all: box containment, any-airport-without-a-prebuild,
 and finding one flight by identity across the whole day.
 
+## Overnight classification
+
+Given a flight *arriving* at a known scheduled local time, did it depart its
+origin on the same local date or the day before? `overnight.py` answers it, and
+the answer is a signed **date offset**, not a boolean:
+
+```
+arr_utc   = arr_local @ tz(arr) -> UTC
+dep_utc   = arr_utc - block_time
+dep_local = dep_utc -> tz(dep)
+offset    = arr_local.date() - dep_local.date()
+```
+
+Crossing the date line westbound makes that `+2` (LAX→SYD) and eastbound makes
+it `0` even on a 14-hour flight (SYD→LAX), so collapsing to a bit too early
+loses two real cases. "Overnight" is `offset >= 1`.
+
+### The margin, not the block time
+
+**The timezone conversion carries the classification; the block time only has to
+avoid walking the computed departure across local midnight.** So the number to
+report is the *margin* — how far the computed departure sits from the nearest
+local midnight — because that, not the block-time residual, is what says whether
+an answer is trustworthy. Checked against eight published schedules, all eight
+offsets were right and every one held under ±90 minutes of injected block-time
+error, on margins of 82–588 minutes. A four-hour margin is immune to any
+plausible error; a twenty-minute margin is a coin toss however good the estimate
+is. Precision in the block time is worth buying only for the marginal cases.
+
+This is why the estimator is deliberately cheap, and why the "large sparse
+matrix" a block-time table seems to need never has to exist:
+
+| block time source | when | note |
+|---|---|---|
+| observed median for the directed pair | `--legs`, n ≥ 3 | carries the wind asymmetry |
+| `45 min + d / 800 km/h` | any pair, never observed | ±15 min from CDG–LHR to SIN–LHR |
+
+Direction matters and a symmetric model gets one side wrong: the distance model
+puts NRT→LAX 1h40 early, because eastbound rides the jet stream. The per-pair
+median is per-direction and absorbs it.
+
+### `airport_tz.csv` — the one input the repo lacked
+
+`airports.csv` has no timezone column, and this question is decided in local
+dates at both ends. `build_airport_tz.py` resolves 6,372 airports (scheduled
+service **or** large/medium — 896 airports typed `small_airport` do carry
+scheduled service, so filtering on `type` alone drops every one of them) into a
+374 KB CSV of IANA **zone names**, 383 distinct.
+
+Zone names, not fixed offsets: being an hour out over a DST boundary flips
+exactly the cases that are already marginal, so `zoneinfo` applies the rules for
+the date in question. There is deliberately no `longitude / 15` fallback — China
+spans five geographic hours in one zone and India is `+05:30`, neither
+recoverable from a meridian. `timezonefinder` is a **generate-time** dependency
+only; the CSV is committed and the pipeline stays on numpy/pyarrow/duckdb.
+
+### The empirical table
+
+`--build-table` writes one row per `(dep, arr, arrival local hour)` with the
+modal offset, the agreement fraction and `n`. Keyed on arrival hour because a
+route can run both a daytime and a red-eye service with different offsets, and
+the caller already knows the scheduled arrival — a free conditioning variable.
+Actual arrivals scatter across adjacent hours, so a route-level rollup at
+`arr_local_hour = -1` is emitted as the fallback for a thin bucket: look up
+`(dep, arr, hour)` first, then `(dep, arr, -1)`.
+
+The column is `day_offset`, not `offset`, which is a reserved word in
+DuckDB/Postgres and would make a bare `SELECT` a parser error downstream.
+
+This is the whole of the "sparse matrix": an edge list of a few tens of
+thousands of rows. A dense matrix over all 85,734 airports would be 7.35 × 10⁹
+cells (14.7 GB of `uint16`); over the 6,372 that matter it is 56 MB, and over
+observed pairs only, ~5 MB of Parquet. The distance model covers everything
+never observed, so nothing needs a matrix layout.
+
+### Two filters that are not optional
+
+- **`dep_gnd AND arr_gnd`.** `build_legs.py` splits the day on the `on_ground`
+  bit alone, so an aircraft that never emits a surface message — about half of
+  them — has its entire day collapsed into a single leg whose `t_off`/`t_on`
+  span every flight it made. `--all-legs` disables the filter; it is there for
+  diagnosis, not for use.
+- **`t_off`/`t_on`, never `t_end - t_start`.** The leg envelope carries half of
+  each adjacent turnaround plus all ramp time on the day's first and last leg.
+  Measured on a synthetic EGLL→LFPG→EGLL pair: 209-minute envelope against 74
+  minutes airborne, the difference being 90 minutes of ramp and 45 of half-
+  turnaround. It is not a flight time and the gap is structured, not noise.
+
+```bash
+./build_airport_tz.py                     # once; needs timezonefinder
+./overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
+./overnight.py --legs airport_ds/flights.parquet --fit
+./overnight.py --legs airport_ds/flights.parquet --build-table overnight.parquet
+```
+
 ## Daily automation
 
 `.github/workflows/daily.yml` runs at **04:00 UTC** (after the ~03:26 UTC
