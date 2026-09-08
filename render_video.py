@@ -85,6 +85,10 @@ REGIONS = {
     "caucasus":      (38.0, 45.0, 40.0, 51.0),
     "central-asia":  (35.0, 47.0, 52.0, 76.0),
     "red-sea":       (12.0, 30.0, 32.0, 44.0),
+    # the whole theatre in one frame: the conflict zone, the northern bypass
+    # (Turkey/Caucasus/Central Asia) and the southern one (Saudi/Red Sea), plus
+    # enough of Europe and India to give the eye somewhere unaffected to anchor.
+    "mideast":       (0.0, 55.0, 20.0, 85.0),
     "n-atlantic":    (35.0, 65.0, -60.0, -10.0),
     "conus":         (25.0, 49.0, -125.0, -67.0),
     "s-asia":        (6.0, 37.0, 60.0, 90.0),
@@ -136,6 +140,24 @@ def merc_y(lat, side):
     lat = np.clip(np.asarray(lat, float), -85.051129, 85.051129)
     s = np.sin(np.radians(lat))
     return (0.5 - np.log((1 + s) / (1 - s)) / (4 * math.pi)) * side
+
+
+def parse_box(spec):
+    """A REGIONS name, or a literal 'lat0,lat1,lon0,lon1'."""
+    if spec in REGIONS:
+        return REGIONS[spec]
+    parts = spec.replace(" ", "").split(",")
+    if len(parts) != 4:
+        sys.exit(f"--crop-region {spec!r}: expected a region name "
+                 f"({', '.join(sorted(REGIONS))}) or 'lat0,lat1,lon0,lon1'")
+    try:
+        la0, la1, lo0, lo1 = (float(x) for x in parts)
+    except ValueError:
+        sys.exit(f"--crop-region {spec!r}: the four values must be numbers")
+    if not (-85 <= la0 < la1 <= 85 and -180 <= lo0 < lo1 <= 180):
+        sys.exit(f"--crop-region {spec!r}: need lat0 < lat1 within +/-85 and "
+                 f"lon0 < lon1 within +/-180")
+    return la0, la1, lo0, lo1
 
 
 def box_slice(side, lat0, lat1, lon0, lon1):
@@ -436,6 +458,17 @@ def main():
                    help="days totalling below this fraction of the local median "
                         "are treated as incomplete runs and interpolated over; "
                         "0 keeps every day as-is")
+    p.add_argument("--crop-region", default=None, metavar="NAME|BOX",
+                   help=f"render only this region instead of the whole world: "
+                        f"a name ({', '.join(sorted(REGIONS))}) or a box "
+                        f"'lat0,lat1,lon0,lon1'. Every correction is still "
+                        f"computed globally -- cropping first would let a "
+                        f"regional event look like an incomplete day and get "
+                        f"dropped, and would leave the coverage reference "
+                        f"outside the frame")
+    p.add_argument("--crop-scale", type=int, default=0, metavar="N",
+                   help="nearest-neighbour magnification for --crop-region; "
+                        "0 picks enough to reach ~1400 px wide")
     p.add_argument("--hold", type=int, default=2, help="frames per day")
     p.add_argument("--fps", type=int, default=24)
     p.add_argument("--no-encode", action="store_true",
@@ -495,10 +528,30 @@ def main():
 
     stack = rolling_mean(stack, a.smooth)
 
-    # Everything below the poles is empty on every day; crop once, using the
-    # union so the frame never changes size mid-animation.
-    rows = crop_rows(stack.mean(axis=0).sum(axis=1), side, side // 128)
-    stack = stack[:, rows, :]
+    # The shot list is computed BEFORE any crop, so its region boxes still
+    # index the full grid and a regional render still reports every region.
+    rank = os.path.join(a.out_dir, "ranking.csv")
+    write_ranking(rank, dates, stack, side, slice(0, side), a.baseline)
+
+    if a.crop_region:
+        box = parse_box(a.crop_region)
+        ys, xs = box_slice(side, *box)
+        stack = stack[:, ys, xs]
+        # A region is a small part of a 2048px world -- the Middle East is
+        # ~370px across -- so it has to be magnified to be a video at all.
+        # Nearest-neighbour on purpose: a pixel IS ~16 km of airspace, and
+        # showing it as a hard block is truer than smoothing it into a haze.
+        up = a.crop_scale or max(1, -(-1400 // stack.shape[2]))
+        km = 40075.017 / side * math.cos(math.radians((box[0] + box[1]) / 2))
+        print(f"cropped to {a.crop_region}: {stack.shape[2]}x{stack.shape[1]} px "
+              f"at ~{km:.0f} km/px, magnified {up}x -> "
+              f"{up * stack.shape[2]}x{up * stack.shape[1]}")
+    else:
+        # Everything below the poles is empty on every day; crop once, using the
+        # union so the frame never changes size mid-animation.
+        rows = crop_rows(stack.mean(axis=0).sum(axis=1), side, side // 128)
+        stack = stack[:, rows, :]
+        up = 1
 
     if a.mode == "absolute":
         lut = ramp(SEQUENTIAL[a.palette or "inferno"])
@@ -513,41 +566,55 @@ def main():
         # Ratio in log space so a halving and a doubling are equal, opposite
         # excursions. Pixels empty in both are pinned to the midpoint rather
         # than counted as a change.
-        eps = max(float(np.percentile(stack[stack > 0], 5)), 1e-6)
-        r = np.log2((stack + eps) / (base + eps))
+        lit = stack[stack > 0]
+        eps = max(float(np.percentile(lit, 5)), 1e-6)
         k = math.log2(max(a.anomaly_clip, 1.0001))
-        t = np.clip(r / k, -1, 1)
-        dead = (stack <= 0) & (base <= 0)
-        t[dead] = 0.0
         floor = 0.0
+        if a.anomaly_floor > 0:
+            floor = max(float(np.percentile(lit, a.anomaly_floor)), 1e-9)
+        del lit
+        # Per DAY, not over the whole cube. Written whole, this arithmetic
+        # stacks six temporaries the size of the cropped stack at once -- for
+        # 248 days that is ~14 GB on top of stack and base, which does not fit
+        # 16 GB. One day at a time costs a few (rows, side) temporaries and is
+        # numerically identical.
+        t = np.empty_like(stack)
+        for i in range(len(stack)):
+            sd, bd = stack[i], base[i]
+            ti = np.log2((sd + eps) / (bd + eps))
+            ti /= k
+            np.clip(ti, -1, 1, out=ti)
+            ti[(sd <= 0) & (bd <= 0)] = 0.0
+            t[i] = ti
         if a.anomaly_floor > 0:
             # Weight each pixel's excursion by how much traffic is actually
             # involved, or a near-empty pixel doubling from nothing to nothing
             # reads as loud as a closed corridor. Against max(day, baseline),
             # NOT the day: a closure drives the day to zero, and weighting by
             # the day alone would fade out precisely the event being looked for.
-            floor = max(float(np.percentile(stack[stack > 0], a.anomaly_floor)),
-                        1e-9)
-            t *= np.clip(np.maximum(stack, base) / floor, 0.0, 1.0)
+            for i in range(len(t)):
+                w = np.maximum(stack[i], base[i]) / floor
+                np.clip(w, 0.0, 1.0, out=w)
+                t[i] *= w
         print(f"anomaly: {a.baseline}-day trailing baseline, "
               f"+/-{a.anomaly_clip}x saturates, eps {eps:.3f}, "
               f"full-strength floor p{a.anomaly_floor} = {floor:.2f}")
         frames = ((t * 0.5 + 0.5) * 255.0 + 0.5).astype(np.uint8)
 
     h = frames.shape[1]
-    scale = max(1, min(3, side // 512))
+    scale = max(1, min(3, (frames.shape[2] * up) // 512))
     paths = []
     for i, d in enumerate(dates):
         img = lut[frames[i]]
+        if up > 1:
+            img = np.repeat(np.repeat(img, up, 0), up, 1)
         if not a.no_stamp:
-            stamp(img, d, 12 * scale, h - 14 * scale, scale, np.uint8([235, 235, 235]))
+            stamp(img, d, 12 * scale, img.shape[0] - 14 * scale, scale,
+                  np.uint8([235, 235, 235]))
         path = os.path.join(a.out_dir, f"f{i:05d}.png")
         write_png(img, path)
         paths.append(path)
     print(f"{len(paths)} frames -> {a.out_dir}  ({img.shape[1]}x{img.shape[0]})")
-
-    rank = os.path.join(a.out_dir, "ranking.csv")
-    write_ranking(rank, dates, stack, side, rows, a.baseline)
     print(f"shot list -> {rank}")
 
     if a.no_encode:
