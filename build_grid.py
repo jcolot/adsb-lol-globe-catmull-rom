@@ -489,9 +489,33 @@ class Accumulator:
         return cells, np.full(len(cells), weight, np.float32)
 
 
-def from_tar_stream(acc, stream, log):
+class _Counted:
+    """A read-only stream that remembers how many bytes it handed out.
+
+    This exists because a truncated tar is INDISTINGUISHABLE from a finished
+    one through tarfile's stream API. On a partial 512-byte header it raises
+    TruncatedHeaderError internally, and CPython's TarFile.next() only
+    re-raises that when offset == 0 -- otherwise it breaks out and returns
+    None, exactly like a clean end-of-archive. So a download cut in half
+    yields a perfectly valid grid built from half a day, which then reads as
+    a traffic collapse. Counting bytes and comparing against the size the
+    release actually advertises is the only reliable check.
+    """
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.n = 0
+
+    def read(self, size=-1):
+        b = self.raw.read(size)
+        self.n += len(b)
+        return b
+
+
+def from_tar_stream(acc, stream, log, expect_bytes=0):
     """Stream a (possibly multi-part concatenated) tar without staging it."""
     n = 0
+    stream = _Counted(stream)
     with tarfile.open(fileobj=stream, mode="r|*") as tf:
         for member in tf:
             if not member.isfile() or "trace_full_" not in member.name:
@@ -512,6 +536,15 @@ def from_tar_stream(acc, stream, log):
             if n % 20000 == 0:
                 log(f"{n} traces, {acc.legs} legs, "
                     f"{int((acc.grid > 0).sum())} px lit")
+    # Drain whatever tarfile left behind (trailing padding, or a part it
+    # stopped short of) so the count reflects the whole transfer.
+    while stream.read(1 << 20):
+        pass
+    if expect_bytes and stream.n < expect_bytes:
+        sys.exit(f"TRUNCATED: read {stream.n:,} of {expect_bytes:,} bytes "
+                 f"({100 * stream.n / expect_bytes:.1f}%) after {n} traces. "
+                 f"Refusing to write a grid from a partial day -- it would "
+                 f"look like a traffic collapse. Re-run this date.")
     return n
 
 
@@ -535,6 +568,15 @@ def from_dir(acc, root, log):
             if n % 20000 == 0:
                 log(f"{n} traces, {acc.legs} legs, "
                     f"{int((acc.grid > 0).sum())} px lit")
+    # Drain whatever tarfile left behind (trailing padding, or a part it
+    # stopped short of) so the count reflects the whole transfer.
+    while stream.read(1 << 20):
+        pass
+    if expect_bytes and stream.n < expect_bytes:
+        sys.exit(f"TRUNCATED: read {stream.n:,} of {expect_bytes:,} bytes "
+                 f"({100 * stream.n / expect_bytes:.1f}%) after {n} traces. "
+                 f"Refusing to write a grid from a partial day -- it would "
+                 f"look like a traffic collapse. Re-run this date.")
     return n
 
 
@@ -578,6 +620,11 @@ def main():
     src.add_argument("--traces", help="directory of extracted trace_full_*.json")
     src.add_argument("--tar-stream", action="store_true",
                      help="read the release tar from stdin, staging nothing")
+    p.add_argument("--expect-bytes", type=int, default=0, metavar="N",
+                   help="with --tar-stream: the total size the release assets "
+                        "advertise. Reading fewer means the transfer was cut "
+                        "off, which tarfile cannot report, so no grid is "
+                        "written. 0 disables the check")
     p.add_argument("--out", help="output .npz (hex_raster.save_grid format)")
     p.add_argument("--grid-zoom", type=int, default=2)
     p.add_argument("--gap-mode", choices=("best", "band", "arc"), default=GAP_MODE,
@@ -609,7 +656,7 @@ def main():
                       band_sigma_frac=a.gap_band_sigma_frac,
                       gap_mode=a.gap_mode)
     if a.tar_stream:
-        n = from_tar_stream(acc, sys.stdin.buffer, log)
+        n = from_tar_stream(acc, sys.stdin.buffer, log, a.expect_bytes)
     else:
         n = from_dir(acc, a.traces, log)
     if not n:

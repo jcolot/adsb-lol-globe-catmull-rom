@@ -87,7 +87,9 @@ jobs:
               out = subprocess.run(
                   ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100",
                    "--jq", '.[] | select(.tag_name | endswith("-planes-readsb-prod-0"))'
-                           ' | [.tag_name, ([.assets[].browser_download_url] | sort | join(" "))]'
+                           ' | [.tag_name,'
+                           '    ([.assets[].browser_download_url] | sort | join(" ")),'
+                           '    ([.assets[].size] | add)]'
                            ' | @tsv'],
                   capture_output=True, text=True)
               if out.returncode != 0:
@@ -96,9 +98,11 @@ jobs:
               for line in out.stdout.splitlines():
                   if not line.strip():
                       continue
-                  tag, urls = line.split("\t", 1)
+                  tag, urls, size = line.split("\t")
                   date = tag[1:11].replace(".", "-")
-                  assets.setdefault(date, urls.split())
+                  # the byte total lets build_grid prove the transfer completed
+                  assets.setdefault(date, {"urls": urls.split(),
+                                           "bytes": int(size)})
 
           days, missing = [], []
           d = start
@@ -180,21 +184,37 @@ jobs:
           for d in "${dates[@]}"; do
             (
               set -eo pipefail
-              mapfile -t urls < <(python3 -c "import json;print('\n'.join(json.load(open('plan.json'))['$d']))")
-              # --tar-stream keeps the 3.9 GB off the runner's small disk, and
-              # overlaps the download with the parse so only the CPU is billed.
-              curl -fsSL --retry 5 --retry-all-errors "${urls[@]}" \
-                | python3 build_grid.py --tar-stream \
-                    --out "grids/$d.npz" \
-                    --grid-zoom "$GRID_ZOOM" \
-                    --gap-mode "$GAP_MODE" >"grids/$d.log" 2>&1
+              mapfile -t urls < <(python3 -c "import json;print('\n'.join(json.load(open('plan.json'))['$d']['urls']))")
+              want=$(python3 -c "import json;print(json.load(open('plan.json'))['$d']['bytes'])")
+              # NO --retry here. curl retrying inside a pipe replays bytes the
+              # parser has already consumed, which corrupts the tar; and a tar
+              # cut at a member boundary is indistinguishable from a finished
+              # one, so the result is a valid grid built from a partial day.
+              # Retry the whole stream instead, and let --expect-bytes prove
+              # the transfer actually completed.
+              # --tar-stream keeps the 3.9 GB off the runner's small disk and
+              # overlaps the download with the parse, so only CPU is billed.
+              for attempt in 1 2 3; do
+                if curl -fsSL "${urls[@]}" \
+                     | python3 build_grid.py --tar-stream \
+                         --out "grids/$d.npz" \
+                         --grid-zoom "$GRID_ZOOM" \
+                         --gap-mode "$GAP_MODE" \
+                         --expect-bytes "$want" >"grids/$d.log" 2>&1; then
+                  exit 0
+                fi
+                echo "attempt $attempt failed for $d, restarting the stream" >>"grids/$d.log"
+                rm -f "grids/$d.npz"
+                sleep $((attempt * 15))
+              done
+              exit 1
             ) &
             pids+=("$!")
           done
           rc=0
           for p in "${pids[@]}"; do wait "$p" || rc=1; done
           for d in "${dates[@]}"; do
-            echo "--- $d ---"; tail -2 "grids/$d.log" || true
+            echo "--- $d ---"; tail -4 "grids/$d.log" || true
           done
           rm -f grids/*.log
           ls -l grids/
