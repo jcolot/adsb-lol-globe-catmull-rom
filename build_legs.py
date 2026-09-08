@@ -18,6 +18,17 @@ Pipeline:
      (one row/leg = the index, sorted by dep), and airports/airport=XXXX/*.parquet
      (each leg written under BOTH its dep and arr airport).
 
+flights.parquet times, in deciseconds past that leg's own base_ts:
+  t_start/t_end  the LEG envelope -- includes half of each adjacent turnaround
+                 plus all ramp time on the day's first and last leg. NOT a
+                 flight time; do not subtract them to get one.
+  t_off/t_on     the airborne run: wheels-off / wheels-on.
+  dep_gnd/arr_gnd  whether that end had a real surface message. False means the
+                 anchor was a climb-out/approach fix, so both the airport and
+                 the t_off/t_on at that end are approximations.
+  base_ts        absolute UTC seconds = base_ts + t/10. Needed because t is
+                 per-aircraft relative and NOT comparable between aircraft.
+
 Usage:  ./build_legs.py [--limit-aircraft N] [--traces PATH] [--meta PATH]
                         [--airports CSV] [--out-dir DIR]
 """
@@ -72,9 +83,15 @@ def _km(la1, lo1, la2, lo2):
 
 
 def segment(ts, la, lo, alt, gnd):
-    """Return (leg_of_point[list], legs[list of (i0,i1)]) for one aircraft.
+    """Return (leg_of_point[list], legs[(i0,i1)], airs[(s,e)]) for one aircraft.
+
     Points are assigned to the nearest flight in time; taxi/parked points fall to
-    the adjacent leg. Returns ([], []) if the aircraft never really flew."""
+    the adjacent leg. Returns ([], [], []) if the aircraft never really flew.
+
+    `airs[k]` is the AIRBORNE run inside `legs[k]` -- the two are aligned by
+    construction, since leg boundaries are cut at the midpoints between
+    consecutive airborne runs. Callers want both: legs[k] is the envelope to
+    draw, airs[k] is the span to time."""
     n = len(ts)
     # airborne runs (on_ground == False)
     runs = []
@@ -96,7 +113,7 @@ def segment(ts, la, lo, alt, gnd):
         if span > FLIGHT_MIN_KM:
             flights.append((s, e))
     if not flights:
-        return [], []
+        return [], [], []
     # leg boundaries: split at temporal midpoint between consecutive flights
     bounds = [0]
     for k in range(len(flights) - 1):
@@ -114,11 +131,11 @@ def segment(ts, la, lo, alt, gnd):
         for idx in range(i0, i1 + 1):
             leg_of[idx] = k
         legs.append((i0, i1))
-    return leg_of, legs
+    return leg_of, legs, flights
 
 
 def _anchor(al, gnd, idxs, head):
-    """Index of the best airport-anchor within one end-window of a leg.
+    """(index, was_ground) of the best airport-anchor within one end-window.
 
     on_ground is the least reliably received bit in the feed: surface position
     messages are low-power and need a receiver with near line-of-sight to the
@@ -130,8 +147,8 @@ def _anchor(al, gnd, idxs, head):
     """
     grounds = [i for i in idxs if gnd[i]]
     if grounds:
-        return grounds[0] if head else grounds[-1]
-    return min(idxs, key=lambda i: al[i])
+        return (grounds[0] if head else grounds[-1]), True
+    return min(idxs, key=lambda i: al[i]), False
 
 
 def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
@@ -147,11 +164,11 @@ def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
     n = i1 - i0 + 1
     w = max(ENDPOINT_MIN_PTS, int(n * ENDPOINT_FRAC))
     w = min(w, max(1, n // 2))              # never let head and tail overlap
-    dep_i = _anchor(al, gnd, range(i0, i0 + w), True)
-    arr_i = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
+    dep_i, dep_gnd = _anchor(al, gnd, range(i0, i0 + w), True)
+    arr_i, arr_gnd = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
     dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5)
     arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5)
-    return dep, arr
+    return dep, arr, dep_gnd, arr_gnd
 
 
 def main():
@@ -170,8 +187,21 @@ def main():
     a = ap.parse_args()
 
     con = duckdb.connect()
-    meta = {r[0]: (r[1], r[2]) for r in
-            con.execute(f"SELECT icao, reg, type FROM '{a.meta}'").fetchall()}
+    # base_ts is what makes leg times comparable BETWEEN aircraft: traces.parquet
+    # stores t as deciseconds past each aircraft's own base_ts, so a raw t_off
+    # from one aircraft cannot be compared with another's. Carry base_ts into the
+    # leg index so any consumer can rebase (absolute UTC = base_ts + t/10).
+    mcols = {c[0] for c in con.execute(
+        f"DESCRIBE SELECT * FROM '{a.meta}'").fetchall()}
+    if "base_ts" in mcols:
+        meta = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+            f"SELECT icao, reg, type, base_ts FROM '{a.meta}'").fetchall()}
+    else:
+        print(f"WARNING: {a.meta} has no base_ts column -- leg times will stay "
+              f"per-aircraft relative and base_ts will be NULL. Re-run "
+              f"fit_spline.py to get one.")
+        meta = {r[0]: (r[1], r[2], None) for r in con.execute(
+            f"SELECT icao, reg, type FROM '{a.meta}'").fetchall()}
     resolve = make_resolver(build_airport_index(a.airports))
     os.makedirs(a.out_dir, exist_ok=True)
 
@@ -219,12 +249,21 @@ def main():
     ac = 0
 
     def finish(icao, ts, la, lo, al, gd, cu):
-        leg_of, legs = segment(ts, la, lo, al, gd)
+        leg_of, legs, airs = segment(ts, la, lo, al, gd)
         if not legs:
             return 0
-        reg, typ = meta.get(icao, (None, None))
+        reg, typ, base = meta.get(icao, (None, None, None))
         for k, (i0, i1) in enumerate(legs):
-            dep, arr = endpoint_airport(la, lo, al, gd, i0, i1, resolve)
+            dep, arr, dep_gnd, arr_gnd = endpoint_airport(
+                la, lo, al, gd, i0, i1, resolve)
+            # t_start/t_end bracket the LEG (half of each adjacent turnaround,
+            # and all of the ramp time on the day's first and last leg), so
+            # t_end - t_start is not a flight time. t_off/t_on bracket the
+            # airborne run instead. When dep_gnd/arr_gnd is false that end never
+            # produced a surface message, so its t_off/t_on is a climb-out or
+            # approach fix rather than a real wheels event -- filter on the flags.
+            s_air, e_air = airs[k]
+            t_off, t_on = ts[s_air], ts[e_air]
             leg_id = f"{icao}_{k}"
             for idx in range(i0, i1 + 1):
                 pbuf["icao"].append(icao); pbuf["t"].append(ts[idx])
@@ -235,7 +274,8 @@ def main():
                 if has_cusp:
                     pbuf["cusp"].append(cu[idx])
             legs_rows.append((leg_id, icao, reg, typ, dep, arr,
-                              ts[i0], ts[i1], i1 - i0 + 1))
+                              ts[i0], ts[i1], t_off, t_on,
+                              dep_gnd, arr_gnd, base, i1 - i0 + 1))
         return len(legs)
 
     for batch in reader:
@@ -268,7 +308,10 @@ def main():
         "reg": [x[2] for x in legs_rows], "type": [x[3] for x in legs_rows],
         "dep": [x[4] for x in legs_rows], "arr": [x[5] for x in legs_rows],
         "t_start": [x[6] for x in legs_rows], "t_end": [x[7] for x in legs_rows],
-        "n_points": [x[8] for x in legs_rows],
+        "t_off": [x[8] for x in legs_rows], "t_on": [x[9] for x in legs_rows],
+        "dep_gnd": [x[10] for x in legs_rows], "arr_gnd": [x[11] for x in legs_rows],
+        "base_ts": [x[12] for x in legs_rows],
+        "n_points": [x[13] for x in legs_rows],
     }).sort_by("dep")
     pq.write_table(lt, os.path.join(a.out_dir, "flights.parquet"),
                    compression="zstd", use_dictionary=["dep", "arr", "type", "reg"])
