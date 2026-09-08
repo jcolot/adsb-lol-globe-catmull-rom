@@ -751,11 +751,73 @@ never observed, so nothing needs a matrix layout.
   minutes airborne, the difference being 90 minutes of ramp and 45 of half-
   turnaround. It is not a flight time and the gap is structured, not noise.
 
+Both filters are necessary and **neither is sufficient**: together they also
+discard every flight the archive boundary cut in half, which is what
+`splice_legs.py` exists to repair. Run the splicer first and point `--legs` at
+its output.
+
+### `splice_legs.py` — the daily cut, and why it biases the wrong way
+
+adsb.lol publishes one archive per UTC day, so a flight airborne at 00:00Z is
+split across two of them. Each half loses an endpoint — the far end is a cruise
+fix hundreds of km from any airport, and `build_legs`' 10 km resolver returns
+`NULL` — so both halves fail `dep IS NOT NULL AND arr IS NOT NULL` and vanish.
+Measured on a synthetic EGLL→KJFK departing 22:00Z:
+
+```
+day D    dep=EGLL  arr=NULL   arr_gnd=false   22:00Z -> 23:59Z   "airborne" 119 min
+day D+1  dep=NULL  arr=KJFK   dep_gnd=false   00:00Z -> 05:59Z   "airborne" 359 min
+overnight.py on either half -> 0 usable legs
+```
+
+**The loss is concentrated exactly where the question is interesting.** It scales
+as roughly `duration / 24` — 31% of JFK–LHR, 58% of LAX–SYD — and 00:00Z is
+20:00 in New York and 17:00 in Los Angeles, the departure peak for the
+transatlantic and transpacific red-eyes that are canonically overnight. Left
+unrepaired, the empirical table is close to blind to `offset >= 1`.
+
+Tier 2 still answers these routes correctly, since the distance model needs no
+observed leg — but they then fall back to the model precisely where it is
+weakest, because wind asymmetry is largest on long-haul.
+
+Matching needs **no time tolerance**, because "the archive cut this leg" is
+exact: a *tail* is the aircraft's last leg of day D with `arr IS NULL` whose
+airborne run reaches the leg's final point (`t_on == t_end`), meaning it was
+still flying when the data stopped — a real landing leaves descent or ground
+fixes after `t_on`. A *head* is the mirror in day D+1. One tail and one head per
+aircraft per boundary makes the key unique, and since any flight under 24 h
+contains at most one 00:00Z, a leg is never cut into three.
+
+What the timestamps *cannot* do is confirm the match, which is why they are not
+used for it: over the North Atlantic the median cruise node gap is 2.7 h, so the
+last fix before midnight can sit hours short of it. Two independent checks
+instead — `--max-gap-h` (default 3.0, sized against that 2.7 h median) on the
+unobserved stretch, and a great-circle speed band on the spliced result, which
+catches a tail joined to an unrelated head without needing any position data.
+
+| fixture | outcome |
+|---|---|
+| still airborne at 23:59Z, head next day | spliced |
+| complete leg | passes through |
+| tail whose aircraft never reappears | rejected, no pair |
+| last fix 20:30Z, head at 02:00Z | rejected, gap 5.5 h |
+| EGLL tail joined to an EHAM head after 8 h | rejected, 46 km/h |
+| dates two apart (retention gap) | nothing spliced |
+
+Two consequences to plan around. A spliced leg spans two `base_ts` frames, so it
+has no single relative time frame: the output carries **absolute** deciseconds
+in `t_off`/`t_on` with `base_ts = 0`, chosen so the usual `base_ts + t/10` rebase
+still yields absolute UTC and readers need no special case. And day D's tails
+cannot be completed until D+1 exists, so **the empirical layer is inherently one
+day lagged** — clients need to know which days are settled, and the oldest
+retained day has no predecessor, leaving its early-morning arrivals unresolved.
+
 ```bash
 ./build_airport_tz.py                     # once; needs timezonefinder
+./splice_legs.py --root legs --out legs_spliced.parquet
 ./overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
-./overnight.py --legs airport_ds/flights.parquet --fit
-./overnight.py --legs airport_ds/flights.parquet --build-table overnight.parquet
+./overnight.py --legs legs_spliced.parquet --fit
+./overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
 ```
 
 ## Daily automation
