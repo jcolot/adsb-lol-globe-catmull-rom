@@ -454,6 +454,47 @@ slide a running total instead, which is bit-identical and needs one
 grids at `--grid-zoom 1` (1024 px, a quarter of it) rather than trimming the
 render.
 
+### Framing a region: aspect, palette, basemap
+
+`--crop-region` takes a name or a literal `lat0,lat1,lon0,lon1`; `--aspect 16:9`
+then grows it, centred, to that ratio. It grows rather than crops, because a
+16:9 frame of a squarish region should add sea and sky around it, not cut the
+routes off at the edges -- and latitude is solved in mercator, not degrees,
+since that is the axis the raster uses. Beware that growing a square box to
+16:9 adds a lot of longitude: `mideast` becomes Morocco-to-Vietnam. For a tight
+frame, give a box that is already near the ratio.
+
+`--palette paper` is light-grounded, for print and for when the faint structure
+is the point: on white the low end is far more visible than on black. Label and
+basemap colours flip automatically (`ink_for`), keyed off the luminance of the
+palette's own ground.
+
+`--basemap geo/coastline.json,geo/borders.json` draws Natural Earth 1:50m
+coastlines and land borders (public domain, stripped of properties and rounded
+to ~100 m, which is well under a pixel) UNDER the traffic. It is rasterised once
+into a ground layer with bilinear splatting -- a hard one-pixel coastline
+crawls once the frame moves -- and every frame is then composited over it using
+its own value as opacity, so the outline shows through empty airspace and
+traffic covers it where there is traffic. In `anomaly` mode the opacity is
+`|t|`, not `t`, because there the neutral value is the middle of the ramp: a
+pixel is transparent when it has not changed, whichever way it might have gone.
+
+**Corrections stay global, and the ordering is the point.** `load_days` crops
+each grid as it reads it and keeps only per-day scalars from the rest of the
+world -- a global total for `partial_days`, the reference region's total for
+`coverage_scale`, one total per region for the shot list. Cropping first would
+feed `partial_days` a regional total, so a regional collapse would be
+classified as an incomplete pipeline run and interpolated away; it would also
+leave the coverage reference outside the frame. The scalar series are carried
+through the day-dropping and gap-filling alongside the frames, then smoothed
+and scaled the same way -- both corrections are linear, so summing a region
+over the smoothed stack equals smoothing that region's summed series, which is
+what lets the shot list still describe the frames.
+
+That crop is also what makes a fine grid usable: 59 days at `--grid-zoom 4` is
+15.8 GB held whole and `rolling_mean` would want twice that, against a region
+window under 300 MB.
+
 ### Crossing a coverage gap
 
 adsb.lol is fed by volunteer ground receivers, so large parts of the world are
