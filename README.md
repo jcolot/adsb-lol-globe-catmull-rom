@@ -909,6 +909,44 @@ from *actual* times and delay moves flights between buckets; fall back to
 `classify()` with `blockFromModel()` for a pair that never flew. Then read
 `marginMin` — under ~60 it is close enough to local midnight not to trust.
 
+### `overnight_client.py` — the same contract, in Python
+
+`overnight_client.py` is a reference client that depends on **nothing in this
+repo**. It reads only the three published files, so it exercises the same
+contract a browser does and would keep working if the rest of the pipeline
+vanished. No `zoneinfo`, no `tzdata`, no `timezonefinder`: the offsets arrive
+already resolved per date, which is the point of shipping them that way, and
+the only arithmetic is integer minutes.
+
+```bash
+# a local partition
+./overnight_client.py --dir legs/date=2026-09-08 \
+    --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
+
+# or straight off R2, fetching the three files itself
+./overnight_client.py --base-url https://pub-XXXX.r2.dev/legs \
+    --date 2026-09-08 --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
+```
+
+```
+KJFK -> EGLL, arriving 2026-08-15 07:30 local
+  departed  2026-08-14 18:49 local (estimated)
+  offset    +1 day  -> OVERNIGHT
+  source    observed hour bucket, n=19, agreement 1.00
+  block     460 min over 5540 km
+  margin    311 min from local midnight
+```
+
+It reports `source` on every answer, so a caller can see which tier produced
+the offset, and prints what the distance model alone *would* have said whenever
+the observed table disagrees with it — the two differing is the interesting
+case, not a warning.
+
+Cross-checked against `overnight.classify` on the eight published schedules:
+8/8 identical offsets and margins, reached without a timezone database. Both
+transports are exercised, and a partition with no `overnight.parquet` — the
+newest day, always — degrades to tier 2 with a note instead of failing.
+
 **`table_settled` matters.** Day D's midnight-crossing legs cannot be spliced
 until D+1 exists, so the settled table published during D's run is for **D-1**
 and is copied into that partition (`rclone copyto`, never `sync` — a sync of a
