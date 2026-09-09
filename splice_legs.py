@@ -99,6 +99,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--airports-tz", default="airport_tz.csv")
     ap.add_argument("--max-gap-h", type=float, default=MAX_GAP_H)
+    ap.add_argument("--dep-date", metavar="YYYY-MM-DD",
+                    help="keep only legs whose wheels-off falls in this UTC "
+                         "date. Splicing needs two days of input, so without "
+                         "this the output spans both and consecutive daily "
+                         "tables would double-count the overlap")
     ap.add_argument("--keep-halves", action="store_true",
                     help="also emit unmatched halves (dep or arr still NULL); "
                          "off by default because a half-leg's t_on is the "
@@ -179,6 +184,15 @@ def main():
                 if (r[4] is None) != (r[5] is None):
                     rows.append((r[0], r[1], r[2], r[3], r[4], r[5],
                                  r[9], r[10], r[6], r[7], 0, r[8]))
+    if a.dep_date:
+        d = dt.date.fromisoformat(a.dep_date)
+        lo = int(dt.datetime(d.year, d.month, d.day,
+                             tzinfo=dt.timezone.utc).timestamp()) * 10
+        hi = lo + 86400 * 10
+        before = len(rows)
+        rows = [r for r in rows if lo <= r[6] < hi]
+        print(f"  --dep-date {a.dep_date}: kept {len(rows)} of {before} "
+              f"legs departing that UTC day")
     spliced_ids = {s[0] for s in spliced}
     rows.sort(key=lambda x: (x[4] or "", x[6]))
 

@@ -111,5 +111,11 @@ jobs:
       - name: Build + verify day bundle
         run: bash run_pipeline.sh bundle
 
+      # Reaches back into date=D-1 to splice flights the archive boundary cut,
+      # so it needs the R2 credentials to read the previous leg index. Skips the
+      # settled table (not the whole phase) when that day is absent.
+      - name: Build overnight artifacts
+        run: bash run_pipeline.sh overnight
+
       - name: Upload to R2
         run: bash run_pipeline.sh upload

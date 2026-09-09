@@ -42,7 +42,7 @@ Usage:
   ./overnight.py --legs airport_ds/flights.parquet --fit
   ./overnight.py --legs airport_ds/flights.parquet --build-table overnight.parquet
 """
-import argparse, csv, datetime as dt, math, sys
+import argparse, csv, datetime as dt, math, os, sys
 from zoneinfo import ZoneInfo
 
 # Rules of thumb, NOT fitted -- replace with --fit against real legs.
@@ -238,6 +238,89 @@ def build_table(legs, airports, out):
           f"(arr_local_hour = -1)")
 
 
+def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
+    """Write the static artifacts a browser needs, into out_dir.
+
+    airports_utc.parquet -- one row per airport: ident, lat/lon (degrees * 1e5,
+    the repo's Q_POS convention), the IANA zone name, and the UTC offset in
+    MINUTES already resolved for this partition's date and the two before it.
+
+    Resolved offsets rather than zone names because the conversion a client
+    needs is local-wall-clock -> UTC, which is the direction Intl.DateTimeFormat
+    does NOT do; doing it from a zone name needs Temporal or an
+    iterate-and-correct loop, including the ambiguous DST hour. An integer
+    offset makes both directions addition, and bakes DST in for the date. The
+    zone name is carried anyway because it dictionary-compresses to nearly
+    nothing and a client that wants to do it properly should be able to.
+
+    Three dates because a departure can be up to two days before the arrival
+    date (a westbound date-line crossing is +2). Only 7 dates in 2026 have a
+    shift at any of these airports, so it rarely matters -- and costs ~4 KB.
+
+    Parquet, not a custom binary: measured at 86 KB against 137 KB raw for an
+    equivalent .bin. The .bin is ~18 KB smaller gzipped, which is not worth a
+    format to decode, version and verify when hyparquet is already loaded for
+    legs.parquet. cells.bin/tracks.bin are binary because posting lists and
+    byte-range records are things Parquet cannot express; a flat 6k-row airport
+    table is not one of those.
+    """
+    import json
+    import pyarrow as pa, pyarrow.parquet as pq
+    d0 = dt.date.fromisoformat(date)
+    rows = []
+    for ident, (lat, lon, tz) in airports.items():
+        o = []
+        for k in (0, 1, 2):
+            d = d0 - dt.timedelta(days=k)
+            o.append(int(dt.datetime(d.year, d.month, d.day, 12,
+                                     tzinfo=tz).utcoffset().total_seconds() // 60))
+        rows.append((ident, int(lat * 1e5), int(lon * 1e5), str(tz), *o))
+    rows.sort()
+    t = pa.table({
+        "ident": [r[0] for r in rows],
+        "lat": pa.array([r[1] for r in rows], pa.int32()),
+        "lon": pa.array([r[2] for r in rows], pa.int32()),
+        "tz": [r[3] for r in rows],
+        "off_d0": pa.array([r[4] for r in rows], pa.int16()),
+        "off_dm1": pa.array([r[5] for r in rows], pa.int16()),
+        "off_dm2": pa.array([r[6] for r in rows], pa.int16()),
+    })
+    ap_path = os.path.join(out_dir, "airports_utc.parquet")
+    pq.write_table(t, ap_path, compression="zstd", use_dictionary=["tz", "ident"])
+
+    fixed, kmh = coef or (BLOCK_FIXED_MIN, BLOCK_KMH)
+    meta = {
+        "date": date,
+        "airports": len(rows),
+        # tier 2: block_min = fixed + 60 * gc_km / kmh
+        "block_fixed_min": round(fixed, 2),
+        "block_kmh": round(kmh, 1),
+        "taxi_min": TAXI_MIN,
+        "min_samples": MIN_SAMPLES,
+        # overnight.parquet is one day behind: day D's midnight-crossing legs
+        # cannot be spliced until D+1 exists, so the settled table is for D-1.
+        "table_date": table_date,
+        "table_legs": n_legs,
+        "table_settled": table_date is not None,
+    }
+    meta_path = os.path.join(out_dir, "overnight_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    # round-trip the artifact rather than trusting the write, in the spirit of
+    # verify_bundle.py gating the bundle
+    back = pq.read_table(ap_path)
+    assert back.num_rows == len(rows), "airports_utc.parquet row count changed"
+    chk = dict(zip(back["ident"].to_pylist(), back["off_d0"].to_pylist()))
+    for ident, _, _, _, o0, _, _ in rows[:200]:
+        assert chk[ident] == o0, f"offset round-trip failed for {ident}"
+    print(f"{len(rows)} airports -> {ap_path} "
+          f"({os.path.getsize(ap_path)/1024:.1f} KB, round-trip ok)")
+    print(f"  -> {meta_path}  block_min = {fixed:.1f} + 60*d/{kmh:.0f}"
+          f"{'' if table_date else '   (no settled table this run)'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--airports-tz", default="airport_tz.csv")
@@ -249,6 +332,13 @@ def main():
                                        "'YYYY-MM-DD HH:MM'")
     p.add_argument("--fit", action="store_true")
     p.add_argument("--build-table", metavar="PARQUET")
+    p.add_argument("--emit-client", metavar="DIR",
+                   help="write airports_utc.parquet + overnight_meta.json for "
+                        "static clients")
+    p.add_argument("--date", help="partition date YYYY-MM-DD, for --emit-client")
+    p.add_argument("--table-date",
+                   help="the date --build-table's legs cover, recorded in "
+                        "overnight_meta.json; omit if no settled table")
     a = p.parse_args()
 
     airports = load_airports(a.airports_tz)
@@ -260,6 +350,12 @@ def main():
         if legs is None:
             sys.exit("--build-table needs --legs")
         build_table(legs, airports, a.build_table)
+    if a.emit_client:
+        if not a.date:
+            sys.exit("--emit-client needs --date")
+        os.makedirs(a.emit_client, exist_ok=True)
+        emit_client(airports, a.date, a.emit_client, coef,
+                    a.table_date, len(legs) if legs else 0)
     if not (a.dep and a.arr and a.arr_local):
         return
 

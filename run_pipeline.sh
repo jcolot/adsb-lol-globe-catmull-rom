@@ -6,6 +6,7 @@
 #   legs     -> split into per-airport leg partitions (build_legs.py)
 #   hexes    -> H3 traffic-density tiles: a raster overview + vector hexbins
 #   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (build_bundle.py)
+#   overnight-> static overnight-classification artifacts (overnight.py)
 #   upload   -> rclone sync the legs to Cloudflare R2
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
 # / `run_pipeline.sh all`). Phases share state through $WORK (the resolved tag is
@@ -38,6 +39,7 @@ BUNDLE_BUCKETS="${BUNDLE_BUCKETS:-8}"
 BUNDLE_MEMORY="${BUNDLE_MEMORY:-}"
 VERIFY_LEGS="${VERIFY_LEGS:-2000}"     # legs round-trip decoded by the gate
 VERIFY_BOXES="${VERIFY_BOXES:-25}"
+OVN_MAX_GAP_H="${OVN_MAX_GAP_H:-3}"    # splice_legs.py boundary gap tolerance
 TAGFILE="$WORK/TAG"
 
 resolve() {
@@ -132,6 +134,60 @@ bundle() {
         --sample-legs "$VERIFY_LEGS" --boxes "$VERIFY_BOXES"
 }
 
+# Static artifacts for the overnight classifier. Deliberately AFTER bundle and
+# before upload, so the date=$date files ride the normal sync.
+#
+# This phase is the one place the pipeline reaches BACKWARDS. A flight airborne
+# at 00:00Z is split across two daily archives, and day D-1's half cannot be
+# completed until day D exists -- so the settled per-day table published here is
+# for D-1, not D, and it is copied into the PREVIOUS partition. Everything else
+# (the UTC-offset table, the meta) is for D and needs no history.
+overnight() {
+    local tag; tag="$(cat "$TAGFILE" 2>/dev/null || echo '?')"
+    local date; date="$(printf '%s' "$tag" | sed -nE 's/^v([0-9]{4})\.([0-9]{2})\.([0-9]{2}).*/\1-\2-\3/p')"
+    [ -n "$date" ] || { echo "could not parse date from tag: $tag"; exit 1; }
+    local prev; prev="$(date -u -d "$date -1 day" +%F 2>/dev/null \
+                        || date -u -j -v-1d -f %F "$date" +%F)"
+
+    # the UTC-offset table and the model coefficients: today's partition, no
+    # history needed
+    local table_args=()
+    local prev_legs="$WORK/overnight/prev-flights.parquet"
+    mkdir -p "$WORK/overnight"
+
+    # D-1's leg index lives in R2, not locally -- fetch it to splice the
+    # boundary. Absent on the first run and after a retention prune, in which
+    # case D-1 simply gets no settled table.
+    if [ -n "${R2_BUCKET:-}" ] && rclone copyto \
+            "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/flights.parquet" "$prev_legs" \
+            --ignore-errors 2>/dev/null && [ -s "$prev_legs" ]; then
+        python3 "$SCRIPT_DIR/splice_legs.py" \
+            "$prev=$prev_legs" "$date=$OUT/legs/flights.parquet" \
+            --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
+            --max-gap-h "$OVN_MAX_GAP_H" --dep-date "$prev" \
+            --out "$WORK/overnight/spliced.parquet"
+        python3 "$SCRIPT_DIR/overnight.py" \
+            --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
+            --legs "$WORK/overnight/spliced.parquet" \
+            --build-table "$WORK/overnight/overnight.parquet"
+        table_args=(--legs "$WORK/overnight/spliced.parquet" --table-date "$prev")
+    else
+        echo "no leg index for $prev in R2 -- skipping the settled table for it"
+    fi
+
+    python3 "$SCRIPT_DIR/overnight.py" \
+        --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
+        --emit-client "$OUT/legs" --date "$date" "${table_args[@]}"
+
+    # the settled table belongs to the PREVIOUS partition, which this run's sync
+    # does not touch -- copy, never sync, or the prior day's files are deleted
+    if [ -s "$WORK/overnight/overnight.parquet" ] && [ -n "${R2_BUCKET:-}" ]; then
+        rclone copyto "$WORK/overnight/overnight.parquet" \
+            "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/overnight.parquet" --checksum
+        echo "settled overnight table -> date=$prev/overnight.parquet"
+    fi
+}
+
 upload() {
     : "${R2_BUCKET:?set R2_BUCKET (Cloudflare R2 bucket name)}"
     local keep="${RETENTION_DAYS:-30}"
@@ -208,7 +264,8 @@ case "${1:-all}" in
     legs)    legs ;;
     hexes)   hexes ;;
     bundle)  bundle ;;
+    overnight) overnight ;;
     upload)  upload ;;
-    all)     resolve; fetch; fit; legs; hexes; bundle; upload ;;
+    all)     resolve; fetch; fit; legs; hexes; bundle; overnight; upload ;;
     *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|bundle|upload|all]" >&2; exit 2 ;;
 esac

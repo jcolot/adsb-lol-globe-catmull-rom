@@ -820,6 +820,104 @@ retained day has no predecessor, leaving its early-morning arrivals unresolved.
 ./overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
 ```
 
+### Static artifacts for external clients
+
+There is no server: clients range-read static files from R2. So the classifier
+ships as **data**, in three files per day.
+
+| file | partition | what |
+|---|---|---|
+| `airports_utc.parquet` | `date=D` | 6,372 airports: `ident`, `lat`/`lon` (degrees x 1e5), `tz`, and `off_d0`/`off_dm1`/`off_dm2` — UTC offset in **minutes** for D, D-1, D-2 |
+| `overnight.parquet` | `date=D-1` | the settled tier-1 lookup, `(dep, arr, arr_local_hour) -> day_offset` |
+| `overnight_meta.json` | `date=D` | tier-2 model coefficients, and whether a settled table exists |
+
+**Parquet, not a custom binary.** Measured: 86 KB against 137 KB raw for an
+equivalent `.bin`. The binary is ~18 KB smaller *gzipped* (63 vs 81 KB), which
+is not worth a format to decode, version and verify when hyparquet is already
+loaded for `legs.parquet` — and the Parquet carries the IANA zone name too,
+which dictionary-compresses to nearly nothing. `cells.bin` and `tracks.bin` are
+binary because posting lists and byte-range records are things Parquet cannot
+express; a flat 6k-row airport table is not one of those.
+
+**Resolved offsets, not zone names**, because the conversion a client needs is
+local-wall-clock → UTC — the direction `Intl.DateTimeFormat` does *not* do.
+From a zone name that needs `Temporal` or an iterate-and-correct loop, including
+the ambiguous DST hour. An integer offset makes both directions addition and
+bakes DST in for the date.
+
+⚠️ **Fetch the partition for the arrival date you are asking about.** The file
+covers only D, D-1 and D-2, which is exactly enough: arrival on D, and a
+departure up to two days earlier for a westbound date-line crossing. Reading a
+D-2 arrival out of *today's* file needs D-3 and the decoder throws — that guard
+is deliberate, and widening the window would hide the misuse without closing it.
+
+Two passes are needed on the departure side: its local date is not known until
+it is computed, and its offset depends on that date. One correction is enough,
+since a DST step is at most an hour.
+
+```js
+const DAY = 1440;
+
+function offMin(rec, d0Ms, dateMs) {
+  const k = Math.round((d0Ms - dateMs) / 86400000);
+  if (k < 0 || k > 2) throw new Error(`date outside the 3-day window (k=${k})`);
+  return [rec.off_d0, rec.off_dm1, rec.off_dm2][k];
+}
+
+// arrLocal: {y, m, d, hh, mm} wall clock at the ARRIVAL airport.
+export function classify(dep, arr, arrLocal, apt, d0Ms, blockMin) {
+  const { y, m, d, hh, mm } = arrLocal;
+  const arrDateMs  = Date.UTC(y, m - 1, d);
+  const arrLocalMin = Date.UTC(y, m - 1, d, hh, mm) / 60000;
+  const arrUtcMin = arrLocalMin - offMin(apt[arr], d0Ms, arrDateMs);
+  const depUtcMin = arrUtcMin - blockMin;
+
+  let off = offMin(apt[dep], d0Ms, arrDateMs);
+  let depLocalMin = depUtcMin + off;
+  const depDateMs = Math.floor(depLocalMin / DAY) * DAY * 60000;
+  if (depDateMs !== arrDateMs) {
+    const off2 = offMin(apt[dep], d0Ms, depDateMs);
+    if (off2 !== off) depLocalMin = depUtcMin + off2;
+  }
+
+  const dayOffset = Math.floor(arrLocalMin / DAY) - Math.floor(depLocalMin / DAY);
+  const into = ((depLocalMin % DAY) + DAY) % DAY;
+  return { dayOffset, overnight: dayOffset >= 1,
+           marginMin: Math.min(into, DAY - into) };
+}
+
+// tier 2, when overnight.parquet has no row for the pair
+export function blockFromModel(a, b, meta) {
+  const R = 6371.0088, r = Math.PI / 180;
+  const p1 = a.lat / 1e5 * r, p2 = b.lat / 1e5 * r;
+  const dp = p2 - p1, dl = (b.lon - a.lon) / 1e5 * r;
+  const h = Math.sin(dp / 2) ** 2
+          + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return meta.block_fixed_min
+       + 60 * (2 * R * Math.asin(Math.sqrt(h))) / meta.block_kmh;
+}
+```
+
+This is not illustrative code: it is cross-checked against `overnight.classify`
+under node on the eight published schedules, and reproduces all eight offsets
+and margins to within a minute of rounding.
+
+**Client order of preference.** Look up `(dep, arr, arr_local_hour)` in
+`overnight.parquet`; fall back to `(dep, arr, -1)` when the hour bucket is thin,
+because a client queries with a *scheduled* arrival while the table is built
+from *actual* times and delay moves flights between buckets; fall back to
+`classify()` with `blockFromModel()` for a pair that never flew. Then read
+`marginMin` — under ~60 it is close enough to local midnight not to trust.
+
+**`table_settled` matters.** Day D's midnight-crossing legs cannot be spliced
+until D+1 exists, so the settled table published during D's run is for **D-1**
+and is copied into that partition (`rclone copyto`, never `sync` — a sync of a
+previous date would delete the rest of it). `date=D` therefore has no
+`overnight.parquet` until the following night, and
+`overnight_meta.json.table_settled` says so. On the first run and after a
+retention prune the previous day is simply absent; the phase logs it and skips
+the settled table rather than failing.
+
 ## Daily automation
 
 `.github/workflows/daily.yml` runs at **04:00 UTC** (after the ~03:26 UTC
@@ -866,6 +964,11 @@ The date is the *data* date, taken from the release tag.
    (plus `traffic.pmtiles.stats.json`)
 5. **The day bundle** for that day: `.../legs/date=<DATE>/` →
    `meta.json`, `legs.parquet`, `cells.bin`, `tracks.bin`
+6. **The overnight artifacts**: `.../legs/date=<DATE>/` →
+   `airports_utc.parquet`, `overnight_meta.json`, and `overnight.parquet` —
+   the last one lands a day later than the other two, since it is settled
+   during the *following* night's run (see *Static artifacts for external
+   clients*)
 
 **Exactly one file per airport.** The per-airport write is single-threaded so each
 partition is a single `data_0.parquet` (DuckDB's parallel partitioned write would

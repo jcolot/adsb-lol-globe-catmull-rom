@@ -297,7 +297,11 @@ def main():
             if has_cusp:
                 cu.append(CU[r])
     if cur is not None:
+        # the loop only counts an aircraft when the NEXT one starts, so the last
+        # one in the stream needs counting here -- without this a single-aircraft
+        # run reported "DONE: 0 aircraft"
         finish(cur, ts, la, lo, al, gd, cu)
+        ac += 1
     flush_points()
     if pw[0] is not None:
         pw[0].close()
