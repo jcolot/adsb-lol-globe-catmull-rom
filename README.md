@@ -966,6 +966,82 @@ intercept by ~11 min. The threshold uses the fitted coefficients and is
 therefore mildly self-referential, but 2× is loose and one iteration converges
 (41.0/856 → 40.8/855).
 
+### Validated against SSIM — the day offset itself
+
+BTS validates the *mechanism*. It cannot validate `day_offset`, because it
+publishes actuals and reaches `+1` only implicitly. SSIM carries the offset
+explicitly, so it is the only ground truth for the question this repo asks.
+`validate_ssim.py` does the comparison; run it against an SSIM you have.
+
+Checked against an AF/KL/TO/HV Summer/Winter 2026 set (397,992 leg records)
+from [transport.data.gouv.fr](https://transport.data.gouv.fr/datasets/programme-des-vols-air-france).
+⚠️ That dataset's licence is **"Non spécifiée"**, so neither the file nor any
+extract of it is committed here or published in the artifacts.
+
+#### The encoding, confirmed from real records
+
+Everything the earlier SSIM section inferred structurally is now verified byte
+for byte, including the field map and Date Variation at **193–194**. The
+alphabet, across all 397,992 legs, is `0` `1` `2` and **`A`, which is minus one
+day** — the letter that section predicted was needed but could not identify (it
+guessed `J`). Observed values: `00` `01` `11` `AA` `A0` `12` `22`.
+
+The offset is **`arr_var - dep_var`**, never the arrival char alone, because
+both are measured from the *itinerary's* first-leg departure:
+
+| record | route | times | DV | offset |
+|---|---|---|---|---|
+| AF 001 | JFK–CDG | 20:30 → 03:55 | `01` | **+1** overnight |
+| AF 2074 | MSP–SEA | 20:40 → 00:35 | `A0` | **+1** (`A` = −1) |
+| AF 1908 | GIG–VIX | 09:20 → 10:30 | `AA` | 0 |
+| AF 029 leg 02 | LAX–CDG | 01:50 → 12:35 | `22` | 0 |
+
+Reading the arrival char alone would call that last one `+2`.
+
+#### The result
+
+| gate applied | patterns | accuracy |
+|---|---|---|
+| none | 67,511 | 94.63% |
+| SSIM elapsed ≤ 0 or > 20 h dropped | 67,176 | 94.72% |
+| **+ physically impossible speed dropped** | **60,133** | **95.71%** |
+
+**The ground truth has errors of its own**, which is why the gates exist. 335
+patterns (0.50%) imply a negative elapsed time from their own fields, and 7,043
+(10.5%) imply an impossible speed — `AF 3615 BOS–AMS` claims 5,548 km in 0.1 h,
+66,572 km/h. **6,588 of those 7,043 carry 4-digit codeshare numbers**: marketing
+records whose date variation the publisher left at `00`, clustering on exactly
+the trans-Pacific westbound crossings where the offset is hardest. Both gates
+use only SSIM's own fields and physical limits, never the fitted block model, so
+they stay independent of what is being scored. They are not free of cost: a
+handful of real flights sit right at the 1,100 km/h bound and get clipped with
+them, so treat 95.71% as the figure for the clean subset and 94.63% as the floor.
+
+#### The margin claim, measured
+
+This is the design's central bet — that the margin, not the block time, tells you
+whether to trust an answer — and 60,133 real schedules settle it:
+
+| margin from local midnight | n | accuracy | share of queries |
+|---|---|---|---|
+| < 30 min | 2,839 | **61.32%** | 4.7% |
+| 30–60 min | 2,537 | 77.69% | 4.2% |
+| 60–120 min | 5,665 | 91.49% | 9.4% |
+| 120–240 min | 10,350 | 96.00% | 17.2% |
+| **≥ 240 min** | 38,742 | **99.95%** | **64.4%** |
+
+Two thirds of queries land in the top bucket at 99.95%; under 30 minutes it is
+barely better than a coin flip. Clients should read `margin_min` and treat
+anything under ~60 as unresolved rather than answered.
+
+And the block time is confirmed not to be the lever: adding 15 minutes to the
+intercept moves the overall score by 0.4 points, all of it inside the low-margin
+buckets. **Do not tune `BLOCK_FIXED_MIN` against an SSIM file** — it is fitting
+to the validation set for a fraction of a point. The residual skew that remains
+(2,263 `+1` called `+0` against 311 the other way) is expected: SSIM times are
+*scheduled* and carry padding that an ADS-B-measured block does not, so a
+measured block runs short of a published one.
+
 ### Static artifacts for external clients
 
 There is no server: clients range-read static files from R2. So the classifier
