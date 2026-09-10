@@ -45,13 +45,31 @@ Usage:
 import argparse, csv, datetime as dt, math, os, sys
 from zoneinfo import ZoneInfo
 
-# FITTED on 2,562 directed pairs from 2026-09-08 (spliced), against per-pair
-# medians so one busy shuttle cannot outvote the long-haul network: residual
-# median |e| 8.7 min, p90 18.2 min. Re-derive with --fit on your own days; the
-# earlier hand-picked 45 min / 800 km/h was close but is superseded.
-BLOCK_FIXED_MIN = 52.2
-BLOCK_KMH = 872.0
-TAXI_MIN = 25.0          # taxi-out + taxi-in, added to a measured AIRBORNE time
+# FITTED on 2,420 directed pairs from 2026-09-08 (spliced, merged legs dropped),
+# against per-pair medians so one busy shuttle cannot outvote the long-haul
+# network: residual median |e| 5.0 min, p90 15.1 min. Re-derive with --fit on
+# your own days. Supersedes a hand-picked 45/800 and then a 52.2/872 fitted
+# before merged legs were being filtered -- those legs were inflating the
+# intercept by ~11 min.
+BLOCK_FIXED_MIN = 41.0
+BLOCK_KMH = 856.0
+# taxi-out + taxi-in, added to a measured AIRBORNE time. MEASURED: BTS June 2026
+# route medians are 15.0 min out and 6.0 min in. US-domestic only, and US hubs
+# taxi long, so treat 21 as a floor for the rest of the world rather than a mean.
+TAXI_MIN = 21.0
+# A leg whose airborne time exceeds this multiple of the distance model's
+# expectation is not one flight. build_legs splits the day on the on_ground bit,
+# so an aircraft that emits surface messages at the ends of its day but not at
+# intermediate turnarounds has its consecutive flights MERGED into one leg --
+# and because both ends then carry real ground fixes, dep_gnd/arr_gnd do not
+# catch it. Validated against BTS: on IAD-EWR (44 min per BTS) the raw legs split
+# into a 36-71 min population and a 226-1000 min one, all four flags true.
+# Filtering at 2x cut the cross-route p99 error from 41.7 to 22.8 min and the max
+# from 320 to 84, while leaving the median at 2.7 -- it removes garbage without
+# disturbing good data. Mildly self-referential, since the threshold uses the
+# fitted coefficients, but 2x is loose enough that they would have to be wrong by
+# a factor of two to change which legs it drops.
+MERGE_FACTOR = 2.0
 MIN_SAMPLES = 3          # below this, an observed median is noise
 R_KM = 6371.0088
 
@@ -142,6 +160,28 @@ def load_legs(path, require_ground=True):
                (t_on - t_off) / 600.0        AS airborne_min
         FROM '{path}' {where}
     """).fetchall()
+
+
+def expected_air_min(dep, arr, airports, coef=None):
+    """Airborne minutes the distance model expects, i.e. block minus taxi."""
+    if dep not in airports or arr not in airports:
+        return None
+    f, k = coef or (BLOCK_FIXED_MIN, BLOCK_KMH)
+    a, b = airports[dep], airports[arr]
+    return (f - TAXI_MIN) + 60.0 * gc_km(a[0], a[1], b[0], b[1]) / k
+
+
+def drop_merged(legs, airports, factor=MERGE_FACTOR, coef=None):
+    """Remove legs that are several flights fused into one. See MERGE_FACTOR."""
+    if not factor:
+        return legs
+    out = []
+    for leg in legs:
+        e = expected_air_min(leg[0], leg[1], airports, coef)
+        if e is not None and leg[4] > factor * e:
+            continue
+        out.append(leg)
+    return out
 
 
 def median(xs):
@@ -328,6 +368,10 @@ def main():
     p.add_argument("--legs", help="flights.parquet from build_legs.py")
     p.add_argument("--all-legs", action="store_true",
                    help="do not require a ground fix at both ends (noisier)")
+    p.add_argument("--merge-factor", type=float, default=MERGE_FACTOR,
+                   help="drop legs whose airborne time exceeds this multiple of "
+                        "the distance model's expectation; 0 disables "
+                        "(default %(default)s)")
     p.add_argument("--dep"); p.add_argument("--arr")
     p.add_argument("--arr-local", help="scheduled arrival, local at --arr: "
                                        "'YYYY-MM-DD HH:MM'")
@@ -345,7 +389,11 @@ def main():
     airports = load_airports(a.airports_tz)
     legs = load_legs(a.legs, not a.all_legs) if a.legs else None
     if legs is not None:
-        print(f"{len(legs)} usable legs", file=sys.stderr)
+        raw = len(legs)
+        legs = drop_merged(legs, airports, a.merge_factor)
+        print(f"{len(legs)} usable legs "
+              f"({raw - len(legs)} dropped as merged multi-flight legs)",
+              file=sys.stderr)
     coef = fit(legs, a.airports_tz) if a.fit else None
     if a.build_table:
         if legs is None:

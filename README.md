@@ -892,6 +892,80 @@ retained day has no predecessor, leaving its early-morning arrivals unresolved.
 ./overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
 ```
 
+### Validated against BTS
+
+US DOT's [Reporting Carrier On-Time Performance](https://www.bts.gov/topics/airlines-and-airports/number-14-time-reporting)
+publishes `WheelsOff` and `WheelsOn` as first-class fields, which is exactly
+what `t_off`/`t_on` estimate — so it is a direct comparison, not a proxy. It also
+carries `TaxiOut`/`TaxiIn`, `AirTime`, and `Tail_Number`, and `build_legs`
+already records `reg`, so the join needs no new plumbing. `airports.csv` has both
+`ident` and `iata_code`, which is the ICAO↔IATA bridge BTS needs.
+
+⚠️ **BTS runs ~3 months behind** — in September 2026 the newest month published
+is June — so there is no date overlap with any day this pipeline has processed
+under the current schema. Per-flight matching by tail number is therefore not
+possible yet. What *is* valid is a per-route comparison, because a route's
+airborne time is stable month to month. Against June 2026 (607,577 flights) and
+2026-09-08/09:
+
+| | |
+|---|---|
+| matched routes (n ≥ 5 both sides) | **1,217** |
+| ADS-B airborne − BTS `AirTime`, median | **−0.9 min** |
+| \|difference\|, median / p90 / p99 | **2.7 / 9.5 / 22.8 min** |
+| within 10 min | **91.0%** |
+
+The residual bias is short and grows with length — −0.2 min under an hour,
+−3.7 min at 4–6 h — which is what losing the ends of a flight to coverage gaps
+looks like: a climb-out received late puts `t_off` late, a descent lost early
+puts `t_on` early, and both bias the same way.
+
+BTS also settles the taxi constant, the one number here that was frankly a
+guess. June route medians are **15.0 min out and 6.0 min in**, so `TAXI_MIN` is
+now 21 rather than 25 — treat it as a floor outside the US, since US hubs taxi
+long.
+
+**What this can and cannot establish.** BTS is *actuals*, and the classifier is
+queried with a *scheduled* arrival, so this validates the mechanism — wheels-off,
+wheels-on, taxi, block time — and not `day_offset` itself. BTS reaches `+1` only
+implicitly (`ArrTime < DepTime` domestically) and can never reach `+2`. For the
+day offset as ground truth you need a schedule source: OAG, Cirium, or an SSIM
+file with its Date Variation field.
+
+#### What it found: merged legs
+
+The comparison immediately surfaced a defect no synthetic fixture had. On
+IAD–EWR, which BTS puts at 44 min, the raw legs split into two clean
+populations — **36–71 min and 226–1000 min** — and *every one of them* had
+`dep_gnd` and `arr_gnd` true.
+
+So the ground-fix filter does **not** protect against the collapse described
+above, contrary to what an earlier version of this section implied. It catches
+only the aircraft that emit *no* surface message at all. An aircraft that emits
+them at the ends of its day but not at intermediate turnarounds has its
+consecutive flights fused into one leg carrying genuine ground fixes at both
+ends — and on a shuttle route that is roughly half the legs.
+
+`MERGE_FACTOR` (default 2.0) drops a leg whose airborne time exceeds twice the
+distance model's expectation. The effect is exactly the right shape — it removes
+garbage without disturbing good data:
+
+| | median \|diff\| | p99 | max |
+|---|---|---|---|
+| unfiltered | 2.8 min | 41.7 min | 320 min |
+| 2× filter | 2.7 min | **22.8 min** | **84 min** |
+
+Only 7 of 1,254 routes moved by more than 10 minutes, but those were the badly
+wrong ones: IAD–EWR 242 → 46 (BTS 44), DEN–MDW 227 → 110 (BTS 110). The
+per-route *median* was already absorbing most of the contamination, which is why
+the headline barely moves — the fix is for the tail.
+
+It also mattered for the fit: dropping merged legs took the block-model residual
+from a median of 8.7 min to **5.0**, because those legs were inflating the
+intercept by ~11 min. The threshold uses the fitted coefficients and is
+therefore mildly self-referential, but 2× is loose and one iteration converges
+(41.0/856 → 40.8/855).
+
 ### Static artifacts for external clients
 
 There is no server: clients range-read static files from R2. So the classifier
