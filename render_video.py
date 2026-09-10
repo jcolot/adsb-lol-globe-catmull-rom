@@ -50,6 +50,7 @@ instead of requiring you to guess them in advance.
 """
 import argparse
 import csv
+import json
 import math
 import os
 import re
@@ -108,6 +109,12 @@ SEQUENTIAL = {
     # the project's own accent, kept for continuity with the map layer
     "amber":   [(8, 11, 15), (48, 26, 12), (109, 50, 12), (176, 87, 20),
                 (255, 158, 61), (255, 205, 140), (255, 245, 225)],
+    # Light-grounded, for print and for when the faint structure is the point:
+    # on white the low end is far more visible than on black, which also means
+    # it shows how much of the frame is interpolated. Ink and basemap colours
+    # flip automatically -- see ink_for().
+    "paper":   [(250, 248, 243), (214, 206, 190), (168, 152, 124),
+                (120, 96, 64), (72, 52, 32), (28, 18, 12)],
     # Strava-ish blue, for when the subject is the network and not the heat
     "ice":     [(3, 6, 14), (10, 32, 66), (16, 68, 122), (30, 116, 165),
                 (86, 168, 200), (170, 214, 230), (240, 250, 255)],
@@ -122,6 +129,17 @@ DIVERGING = {
                     (24, 26, 30),
                     (70, 24, 28), (190, 48, 44), (255, 170, 140)],
 }
+
+
+def ink_for(lut):
+    """Foreground colour that reads against this palette's ground.
+
+    A light-grounded palette needs dark labels and a dark basemap; the same
+    near-white text that works on inferno is invisible on paper.
+    """
+    g = lut[0].astype(float)
+    lum = 0.2126 * g[0] + 0.7152 * g[1] + 0.0722 * g[2]
+    return (np.uint8([28, 24, 20]) if lum > 127 else np.uint8([235, 235, 235]))
 
 
 def ramp(stops, n=256):
@@ -160,6 +178,55 @@ def parse_box(spec):
     return la0, la1, lo0, lo1
 
 
+def _merc_frac(lat):
+    """Mercator y as a fraction of the world square, 0 at the north edge."""
+    s = math.sin(math.radians(max(-85.051129, min(85.051129, lat))))
+    return 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+
+
+def _merc_lat(y):
+    """Inverse of _merc_frac."""
+    t = (0.5 - y) * 4 * math.pi
+    return math.degrees(math.asin(math.tanh(t / 2)))
+
+
+def fit_aspect(box, spec):
+    """Grow `box` to a target aspect, centred, so nothing asked for is lost.
+
+    Grows rather than crops: a 16:9 frame of a squarish region should add sky
+    and sea around it, not cut off the routes at the edges. Latitude has to be
+    solved in mercator, not degrees, since that is the axis the raster uses.
+    """
+    try:
+        wr, hr = (float(x) for x in spec.replace("/", ":").split(":"))
+        if wr <= 0 or hr <= 0:
+            raise ValueError
+    except ValueError:
+        sys.exit(f"--aspect {spec!r}: expected W:H, e.g. 16:9")
+    target = wr / hr
+    la0, la1, lo0, lo1 = box
+    w = (lo1 - lo0) / 360.0
+    h = abs(_merc_frac(la1) - _merc_frac(la0))
+    if w / h < target:                       # too tall: widen in longitude
+        need = target * h * 360.0
+        mid = (lo0 + lo1) / 2
+        lo0, lo1 = mid - need / 2, mid + need / 2
+        if lo0 < -180:
+            lo0, lo1 = -180.0, min(180.0, -180.0 + need)
+        elif lo1 > 180:
+            lo0, lo1 = max(-180.0, 180.0 - need), 180.0
+    else:                                    # too wide: extend in latitude
+        need = w / target
+        mid = (_merc_frac(la0) + _merc_frac(la1)) / 2
+        y0, y1 = mid - need / 2, mid + need / 2
+        if y0 < 0:
+            y0, y1 = 0.0, min(1.0, need)
+        elif y1 > 1:
+            y0, y1 = max(0.0, 1.0 - need), 1.0
+        la1, la0 = _merc_lat(y0), _merc_lat(y1)
+    return la0, la1, lo0, lo1
+
+
 def box_slice(side, lat0, lat1, lon0, lon1):
     """Region box -> array slices on a `side` x `side` mercator grid."""
     y0 = int(merc_y(lat1, side)); y1 = int(merc_y(lat0, side))
@@ -167,6 +234,70 @@ def box_slice(side, lat0, lat1, lon0, lon1):
     x1 = int((lon1 + 180.0) / 360.0 * side)
     return (slice(max(0, y0), min(side, max(y1, y0 + 1))),
             slice(max(0, x0), min(side, max(x1, x0 + 1))))
+
+
+def load_lines(paths):
+    """Polylines from GeoJSON LineString/MultiLineString features."""
+    out = []
+    for path in paths:
+        try:
+            doc = json.load(open(path))
+        except OSError as e:
+            sys.exit(f"--basemap {path}: {e}")
+        feats = doc.get("features", [doc]) if isinstance(doc, dict) else doc
+        for ft in feats:
+            g = (ft or {}).get("geometry") or ft
+            t = (g or {}).get("type")
+            if t == "LineString":
+                out.append(g["coordinates"])
+            elif t == "MultiLineString":
+                out.extend(g["coordinates"])
+            elif t == "Polygon":
+                out.extend(g["coordinates"])
+            elif t == "MultiPolygon":
+                for poly in g["coordinates"]:
+                    out.extend(poly)
+    if not out:
+        sys.exit(f"no LineString/Polygon geometry in {', '.join(paths)}")
+    return out
+
+
+def rasterize_lines(lines, side, ys, xs, up):
+    """Antialiased coverage for `lines` in the cropped, magnified pixel frame.
+
+    Splats bilinearly rather than setting pixels, because a hard one-pixel
+    coastline crawls and shimmers once the frame is in motion.
+    """
+    h = (ys.stop - ys.start) * up
+    w = (xs.stop - xs.start) * up
+    cov = np.zeros((h, w), np.float32)
+    for coords in lines:
+        if len(coords) < 2:
+            continue
+        pts = np.asarray(coords, np.float64)[:, :2]
+        x = ((pts[:, 0] + 180.0) / 360.0 * side - xs.start) * up
+        y = np.array([_merc_frac(v) for v in pts[:, 1]]) * side
+        y = (y - ys.start) * up
+        for i in range(len(x) - 1):
+            x0, y0, x1, y1 = x[i], y[i], x[i + 1], y[i + 1]
+            if abs(x1 - x0) > w:                 # antimeridian wrap
+                continue
+            if (max(x0, x1) < 0 or min(x0, x1) > w - 1
+                    or max(y0, y1) < 0 or min(y0, y1) > h - 1):
+                continue
+            n = int(max(abs(x1 - x0), abs(y1 - y0)) * 2) + 2
+            sx = np.linspace(x0, x1, n)
+            sy = np.linspace(y0, y1, n)
+            ok = (sx >= 0) & (sx <= w - 1.001) & (sy >= 0) & (sy <= h - 1.001)
+            if not ok.any():
+                continue
+            sx, sy = sx[ok], sy[ok]
+            ix, iy = sx.astype(np.int32), sy.astype(np.int32)
+            fx, fy = sx - ix, sy - iy
+            for dx, dy, wt in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                               (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+                np.add.at(cov, (iy + dy, ix + dx), wt.astype(np.float32))
+    return np.clip(cov, 0.0, 1.0)
 
 
 def crop_rows(row_weight, side, pad, keep=0.999):
@@ -280,8 +411,17 @@ def stamp(img, text, x, y, scale, rgb):
 
 
 # --- pipeline -------------------------------------------------------------
-def load_days(src, start=None, end=None):
-    """Read every YYYY-MM-DD.npz in `src` into one (days, side, side) stack."""
+def load_days(src, start=None, end=None, box=None):
+    """Read every YYYY-MM-DD.npz in `src` into one (days, h, w) stack.
+
+    With `box`, only that window is kept, and the global grid is released as
+    soon as the per-day scalars are taken from it. That is what makes a fine
+    grid usable at all: a 59-day 8192px run is 15.8 GB held whole, and
+    rolling_mean would want twice that, but the region window is under 300 MB.
+    Nothing is lost, because every correction that needs the rest of the world
+    needs only SUMS from it -- partial_days a global total, coverage_scale the
+    reference region's total, the shot list a total per region.
+    """
     files = []
     for name in sorted(os.listdir(src)):
         m = DATE_RE.search(name)
@@ -294,19 +434,29 @@ def load_days(src, start=None, end=None):
     if not files:
         sys.exit(f"no YYYY-MM-DD.npz grids in {src}")
     dates, stack, side, producers = [], [], None, {}
+    totals, reg = [], {k: [] for k in REGIONS}
+    win = None
     for d, path in files:
         g, _, _ = hex_raster.load_grid(path)
         if side is None:
             side = g.shape[0]
+            win = box_slice(side, *box) if box else None
         elif g.shape[0] != side:
             sys.exit(f"{path}: side {g.shape[0]} != {side}; all days must share a --grid-zoom")
         producers.setdefault(hex_raster.grid_producer(path), []).append(d)
+        totals.append(float(g.sum()))
+        for name, b in REGIONS.items():
+            ys, xs = box_slice(side, *b)
+            reg[name].append(float(g[ys, xs].sum()))
         dates.append(d)
-        stack.append(g)
-    return dates, np.stack(stack), producers
+        stack.append(g[win[0], win[1]].copy() if win else g)
+        del g
+    stats = {"total": np.array(totals, np.float64),
+             "region": {k: np.array(v, np.float64) for k, v in reg.items()}}
+    return dates, np.stack(stack), producers, side, stats
 
 
-def fill_missing(dates, stack):
+def fill_missing(dates, stack, extra=()):
     """Insert a linearly interpolated frame for every absent calendar day, so
     the animation runs at a constant time rate. A gap left as a cut reads as an
     event, which is the one thing this must not invent."""
@@ -316,23 +466,26 @@ def fill_missing(dates, stack):
     d1 = dt.date.fromisoformat(dates[-1])
     span = [(d0 + dt.timedelta(days=k)).isoformat()
             for k in range((d1 - d0).days + 1)]
-    out = np.empty((len(span),) + stack.shape[1:], np.float32)
+    arrays = [stack] + [np.asarray(e, np.float64) for e in extra]
+    outs = [np.empty((len(span),) + a.shape[1:], a.dtype) for a in arrays]
     filled = []
     known = [i for i, d in enumerate(span) if d in have]
     for i, d in enumerate(span):
         if d in have:
-            out[i] = stack[have[d]]
+            for a, o in zip(arrays, outs):
+                o[i] = a[have[d]]
             continue
         lo = max([k for k in known if k < i], default=known[0])
         hi = min([k for k in known if k > i], default=known[-1])
         w = 0.5 if hi == lo else (i - lo) / (hi - lo)
-        out[i] = (1 - w) * out[lo] if hi == lo else \
-                 (1 - w) * stack[have[span[lo]]] + w * stack[have[span[hi]]]
+        for a, o in zip(arrays, outs):
+            o[i] = (1 - w) * o[lo] if hi == lo else \
+                   (1 - w) * a[have[span[lo]]] + w * a[have[span[hi]]]
         filled.append(d)
-    return span, out, filled
+    return span, outs[0], filled, outs[1:]
 
 
-def partial_days(dates, stack, frac, win=29):
+def partial_days(dates, tot, frac, win=29):
     """Days whose total is far below the local rolling median.
 
     These are almost always an incomplete pipeline run, not a quiet day, and
@@ -343,7 +496,6 @@ def partial_days(dates, stack, frac, win=29):
     fabricated events. So they are treated as MISSING and interpolated over,
     which is honest about knowing nothing rather than inventing a collapse.
     """
-    tot = np.array([g.sum() for g in stack], np.float64)
     half = max(1, win // 2)
     med = np.array([np.median(tot[max(0, i - half):i + half + 1])
                     for i in range(len(tot))])
@@ -379,7 +531,7 @@ def rolling_mean(stack, win):
     return out
 
 
-def coverage_scale(stack, side, region, win=28):
+def coverage_scale(tot, region, win=28):
     """Per-day multiplier that flattens SLOW drift in the reference region.
 
     The subtlety that matters: divide by the region's *daily* total and you also
@@ -388,8 +540,6 @@ def coverage_scale(stack, side, region, win=28):
     trend, so only the trend should be divided out. So the divisor is a rolling
     median of the reference total, and everything faster than `win` survives.
     """
-    sl = box_slice(side, *REGIONS[region])
-    tot = stack[:, sl[0], sl[1]].sum(axis=(1, 2))
     if not np.all(tot > 0):
         sys.exit(f"reference region {region!r} is empty on some days; pick another")
     half = max(1, win // 2)
@@ -466,6 +616,14 @@ def main():
                         f"regional event look like an incomplete day and get "
                         f"dropped, and would leave the coverage reference "
                         f"outside the frame")
+    p.add_argument("--basemap", default=None, metavar="A.geojson[,B.geojson]",
+                   help="draw these GeoJSON polylines under the traffic "
+                        "(coastlines, borders). Needs --crop-region")
+    p.add_argument("--basemap-alpha", type=float, default=0.45,
+                   help="how strongly the outline is inked, 0..1")
+    p.add_argument("--aspect", default=None, metavar="W:H",
+                   help="grow --crop-region to this aspect, centred, e.g. 16:9. "
+                        "Grows rather than crops, so nothing asked for is lost")
     p.add_argument("--crop-scale", type=int, default=0, metavar="N",
                    help="nearest-neighbour magnification for --crop-region; "
                         "0 picks enough to reach ~1400 px wide")
@@ -480,9 +638,11 @@ def main():
     a = p.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
-    dates, stack, producers = load_days(a.grids, a.start, a.end)
-    side = stack.shape[1]
-    print(f"{len(dates)} days, {side}x{side}, {dates[0]} .. {dates[-1]}")
+    box = parse_box(a.crop_region) if a.crop_region else None
+    if box and a.aspect:
+        box = fit_aspect(box, a.aspect)
+    dates, stack, producers, side, stats = load_days(a.grids, a.start, a.end, box)
+    print(f"{len(dates)} days, grid {side}x{side}, {dates[0]} .. {dates[-1]}")
 
     # build_grid.py reads ~5x higher than build_hexes.py for the same pixel
     # (measured; see hex_raster.grid_producer). Either is fine alone. Spliced
@@ -504,7 +664,7 @@ def main():
         print(f"producer: {next(iter(producers))}")
 
     if a.min_day_frac > 0:
-        bad = partial_days(dates, stack, a.min_day_frac)
+        bad = partial_days(dates, stats["total"], a.min_day_frac)
         if bad:
             print("DROPPED as incomplete runs (interpolated over): "
                   + ", ".join(f"{d} ({r:.2f}x median)" for d, r in bad))
@@ -514,29 +674,45 @@ def main():
                 sys.exit("--min-day-frac rejected almost everything; raise it")
             dates = [dates[i] for i in keep]
             stack = stack[keep]
+            stats["total"] = stats["total"][keep]
+            stats["region"] = {k: v[keep] for k, v in stats["region"].items()}
 
-    dates, stack, filled = fill_missing(dates, stack)
+    # the scalar series ride along, or a dropped day would knock them out of
+    # step with the frames and the coverage fix would scale the wrong dates
+    keys = sorted(stats["region"])
+    dates, stack, filled, extra = fill_missing(
+        dates, stack, [stats["total"]] + [stats["region"][k] for k in keys])
+    stats["total"] = extra[0]
+    stats["region"] = dict(zip(keys, extra[1:]))
     if filled:
         print(f"interpolated {len(filled)} absent day(s): {', '.join(filled)}")
 
     if not a.no_coverage_fix:
-        sc = coverage_scale(stack, side, a.coverage_ref, a.coverage_win)
+        sc = coverage_scale(stats["region"][a.coverage_ref], a.coverage_ref,
+                            a.coverage_win)
         print(f"coverage fix vs {a.coverage_ref} trend "
               f"({a.coverage_win}d): x{sc.min():.3f} .. x{sc.max():.3f} "
               f"(drift {100*(sc.max()/sc.min()-1):.1f}% over the run)")
         stack *= sc[:, None, None]
+        stats["region"] = {k: v * sc for k, v in stats["region"].items()}
 
     stack = rolling_mean(stack, a.smooth)
+    # The shot list must describe the FRAMES, not the raw days, or it nominates
+    # a spike the smoothing already removed. Both corrections are linear, so
+    # summing a region over the smoothed stack is the same as smoothing that
+    # region's summed series -- which is what lets the series be carried as
+    # scalars while the frames are cropped to one region.
+    if a.smooth > 1:
+        stats["region"] = {
+            k: rolling_mean(v.reshape(-1, 1, 1), a.smooth).reshape(-1)
+            for k, v in stats["region"].items()}
 
     # The shot list is computed BEFORE any crop, so its region boxes still
     # index the full grid and a regional render still reports every region.
     rank = os.path.join(a.out_dir, "ranking.csv")
-    write_ranking(rank, dates, stack, side, slice(0, side), a.baseline)
+    write_ranking(rank, dates, stats["region"], a.baseline)
 
-    if a.crop_region:
-        box = parse_box(a.crop_region)
-        ys, xs = box_slice(side, *box)
-        stack = stack[:, ys, xs]
+    if box is not None:
         # A region is a small part of a 2048px world -- the Middle East is
         # ~370px across -- so it has to be magnified to be a video at all.
         # Nearest-neighbour on purpose: a pixel IS ~16 km of airspace, and
@@ -560,6 +736,7 @@ def main():
         print(f"absolute: one divisor for the run, p{a.clip} = {top:.1f}")
         norm = np.power(np.clip(stack / top, 0, 1), 1.0 / a.gamma)
         frames = (norm * 255.0 + 0.5).astype(np.uint8)
+        alpha8 = frames          # density IS the opacity: empty sky stays paper
     else:
         lut = ramp(DIVERGING[a.palette or "cyan-orange"])
         base = trailing_baseline(stack, a.baseline)
@@ -600,17 +777,49 @@ def main():
               f"+/-{a.anomaly_clip}x saturates, eps {eps:.3f}, "
               f"full-strength floor p{a.anomaly_floor} = {floor:.2f}")
         frames = ((t * 0.5 + 0.5) * 255.0 + 0.5).astype(np.uint8)
+        # |t|, not t: in anomaly mode the neutral value is the MIDDLE of the
+        # ramp, so a pixel is transparent when it has not changed, whichever
+        # direction it would have moved in.
+        alpha8 = (np.abs(t) * 255.0 + 0.5).astype(np.uint8)
 
     h = frames.shape[1]
     scale = max(1, min(3, (frames.shape[2] * up) // 512))
+    ink = ink_for(lut)
+
+    # The basemap is drawn ONCE into a ground layer, and every frame is
+    # composited over it using its own value as opacity -- so the outline shows
+    # through empty airspace and the traffic covers it where there is traffic.
+    base = None
+    if a.basemap:
+        if box is None:
+            sys.exit("--basemap needs --crop-region: the whole-world frame is "
+                     "cropped to whatever rows happen to be lit, so the "
+                     "projection of the outline would not line up")
+        ys_win, xs_win = box_slice(side, *box)
+        lines = load_lines([q.strip() for q in a.basemap.split(",") if q.strip()])
+        cov = rasterize_lines(lines, side, ys_win, xs_win, up)
+        ground = lut[0].astype(np.float32)
+        wgt = (cov * a.basemap_alpha)[..., None]
+        base = ground * (1.0 - wgt) + ink.astype(np.float32) * wgt
+        print(f"basemap: {len(lines)} polylines, "
+              f"{100 * float((cov > 0.01).mean()):.1f}% of the frame inked")
+
     paths = []
     for i, d in enumerate(dates):
-        img = lut[frames[i]]
+        v = frames[i]
         if up > 1:
-            img = np.repeat(np.repeat(img, up, 0), up, 1)
+            v = np.repeat(np.repeat(v, up, 0), up, 1)
+        if base is None:
+            img = lut[v]
+        else:
+            al = alpha8[i]
+            if up > 1:
+                al = np.repeat(np.repeat(al, up, 0), up, 1)
+            al = (al.astype(np.float32) / 255.0)[..., None]
+            img = (base * (1.0 - al) + lut[v].astype(np.float32) * al
+                   + 0.5).astype(np.uint8)
         if not a.no_stamp:
-            stamp(img, d, 12 * scale, img.shape[0] - 14 * scale, scale,
-                  np.uint8([235, 235, 235]))
+            stamp(img, d, 12 * scale, img.shape[0] - 14 * scale, scale, ink)
         path = os.path.join(a.out_dir, f"f{i:05d}.png")
         write_png(img, path)
         paths.append(path)
@@ -636,18 +845,16 @@ def main():
     print(f"video -> {mp4} ({os.path.getsize(mp4)/1e6:.1f} MB)")
 
 
-def write_ranking(path, dates, stack, side, rows, baseline):
+def write_ranking(path, dates, reg, baseline):
     """Per-region daily totals against their own trailing baseline, biggest
-    deviation first. This is the shot list: it nominates what to look at."""
+    deviation first. This is the shot list: it nominates what to look at.
+
+    Works from the per-region totals collected at load time, so it still
+    reports every region when the frames are cropped to just one of them.
+    """
     out = []
-    for name, box in REGIONS.items():
-        sl = box_slice(side, *box)
-        # the stack is already row-cropped; shift the region's rows to match
-        r = slice(max(0, sl[0].start - rows.start), max(0, sl[0].stop - rows.start))
-        if r.stop <= r.start:
-            continue
-        series = stack[:, r, sl[1]].sum(axis=(1, 2))
-        if series.max() <= 0:
+    for name, series in reg.items():
+        if len(series) != len(dates) or series.max() <= 0:
             continue
         for i in range(len(dates)):
             a0 = max(0, i - baseline)
@@ -661,10 +868,8 @@ def write_ranking(path, dates, stack, side, rows, baseline):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["region", "date", "total", "baseline", "pct_change"])
-        for name, d, tot, b, pc in out:
-            w.writerow([name, d, f"{tot:.1f}", f"{b:.1f}", f"{100*pc:+.1f}"])
-    return out
-
+        for name, d, day, b, pc in out:
+            w.writerow([name, d, f"{day:.1f}", f"{b:.1f}", f"{100*pc:+.1f}"])
 
 if __name__ == "__main__":
     main()
