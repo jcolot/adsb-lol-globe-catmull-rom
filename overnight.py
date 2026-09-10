@@ -45,11 +45,12 @@ Usage:
 import argparse, csv, datetime as dt, math, os, sys
 from zoneinfo import ZoneInfo
 
-# Rules of thumb, NOT fitted -- replace with --fit against real legs.
-# 45 min fixed + 800 km/h reproduces published block times within ~15 min from
-# CDG-LHR (348 km) to SIN-LHR (10,850 km), which is well inside a typical margin.
-BLOCK_FIXED_MIN = 45.0
-BLOCK_KMH = 800.0
+# FITTED on 2,562 directed pairs from 2026-09-08 (spliced), against per-pair
+# medians so one busy shuttle cannot outvote the long-haul network: residual
+# median |e| 8.7 min, p90 18.2 min. Re-derive with --fit on your own days; the
+# earlier hand-picked 45 min / 800 km/h was close but is superseded.
+BLOCK_FIXED_MIN = 52.2
+BLOCK_KMH = 872.0
 TAXI_MIN = 25.0          # taxi-out + taxi-in, added to a measured AIRBORNE time
 MIN_SAMPLES = 3          # below this, an observed median is noise
 R_KM = 6371.0088

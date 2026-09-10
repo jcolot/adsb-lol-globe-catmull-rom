@@ -55,6 +55,13 @@ from overnight import load_airports, gc_km
 
 MAX_GAP_H = 3.0
 MIN_KMH, MAX_KMH = 100.0, 1100.0   # plausible block-average ground speed
+# The longest scheduled nonstop is ~19 h, so a spliced leg claiming more than
+# this is wrong no matter what distance it covers. The speed band alone does NOT
+# catch these: on real data a 45.6 h KDSM->VHHH splice worked out to 254 km/h,
+# comfortably inside the band. They are collapse-bug legs -- an aircraft that
+# never emits a surface message has its whole day made one leg, and two of those
+# joined span two days.
+MAX_AIR_H = 20.0
 DATE_RE = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 
 COLS = ["leg_id", "icao", "reg", "type", "dep", "arr",
@@ -70,8 +77,35 @@ def discover(root):
     return out
 
 
-def read_day(con, date, path):
-    """One day's legs with absolute-UTC deciseconds, plus the cut markers."""
+def read_day(con, date, path, max_gap_h=MAX_GAP_H):
+    """One day's legs with absolute-UTC deciseconds, plus the cut markers.
+
+    `t_on == t_end` alone is NOT a midnight cut. It says only "still airborne at
+    the last fix", which is equally true of an aircraft that flew out of
+    receiver coverage -- and measured on 2026-09-08, 42% of the legs matching it
+    had their last fix more than SIX HOURS before the boundary, so they are
+    coverage dropouts, not archive cuts. Requiring the last fix to be within
+    max_gap_h of the boundary separates the two.
+
+    This does not change which pairs are accepted: a tail far from the boundary
+    whose head is just past it already fails the gap check by construction. It
+    shrinks the candidate pool and makes the rejection counts mean what they
+    say.
+
+    A half must also carry the endpoint the splice exists to recover -- a tail
+    needs a `dep`, a head needs an `arr`. Without that, splicing a dep-less tail
+    onto an arr-less head yields a leg with NEITHER endpoint, which nothing
+    downstream can use and which silently skips the speed check, having no
+    airports to measure between. On real data these were the aircraft that never
+    emit a surface message: build_legs collapses their whole day into a single
+    leg, and two of those spliced together came out as 48 HOURS airborne.
+    """
+    d = dt.date.fromisoformat(date)
+    # 00:00Z that ENDS this day, and the one that begins it, in deciseconds
+    end_ds = int(dt.datetime(d.year, d.month, d.day,
+                             tzinfo=dt.timezone.utc).timestamp() + 86400) * 10
+    beg_ds = end_ds - 86400 * 10
+    win = int(max_gap_h * 3600 * 10)
     return con.execute(f"""
         WITH l AS (
             SELECT leg_id, icao, reg, type, dep, arr, dep_gnd, arr_gnd, n_points,
@@ -84,10 +118,20 @@ def read_day(con, date, path):
         )
         SELECT leg_id, icao, reg, type, dep, arr, dep_gnd, arr_gnd, n_points,
                off_ds, on_ds,
-               -- still airborne when this archive ended
-               (arr IS NULL AND t_on = t_end   AND seq = n_legs) AS is_tail,
+               -- still airborne when this archive ended, AND close enough to
+               -- the boundary that the archive is a plausible reason for it,
+               -- AND carrying the endpoint the splice is supposed to recover
+               (arr IS NULL AND dep IS NOT NULL
+                AND t_on = t_end AND seq = n_legs
+                AND {end_ds} - on_ds <= {win})                    AS is_tail,
                -- already airborne when the next archive began
-               (dep IS NULL AND t_off = t_start AND seq = 1)     AS is_head
+               (dep IS NULL AND arr IS NOT NULL
+                AND t_off = t_start AND seq = 1
+                AND off_ds - {beg_ds} <= {win})                   AS is_head,
+               -- airborne at the last fix but nowhere near the boundary: the
+               -- aircraft left coverage, which is a different thing entirely
+               (arr IS NULL AND t_on = t_end AND seq = n_legs
+                AND {end_ds} - on_ds > {win})                     AS is_dropout
         FROM l
     """).fetchall()
 
@@ -99,6 +143,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--airports-tz", default="airport_tz.csv")
     ap.add_argument("--max-gap-h", type=float, default=MAX_GAP_H)
+    ap.add_argument("--max-air-h", type=float, default=MAX_AIR_H,
+                    help="reject a splice claiming more airborne time than "
+                         "this (default %(default)s h)")
     ap.add_argument("--dep-date", metavar="YYYY-MM-DD",
                     help="keep only legs whose wheels-off falls in this UTC "
                          "date. Splicing needs two days of input, so without "
@@ -123,14 +170,15 @@ def main():
 
     airports = load_airports(a.airports_tz)
     con = duckdb.connect()
-    per_day = {d: read_day(con, d, p) for d, p in days}
+    per_day = {d: read_day(con, d, p, a.max_gap_h) for d, p in days}
     for d, p in days:
         print(f"  {d}: {len(per_day[d])} legs  ({p})")
 
     complete, spliced = [], []
     matched_heads = set()          # head leg_ids consumed, counted once
     tails_left = 0
-    rej_gap = rej_speed = rej_nopair = 0
+    rej_gap = rej_speed = rej_nopair = rej_air = 0
+    dropouts = sum(1 for rows in per_day.values() for r in rows if r[13])
 
     dates = [d for d, _ in days]
     for i, d in enumerate(dates):
@@ -148,7 +196,7 @@ def main():
                     heads.setdefault(r[1], r)  # icao -> head row
         for r in rows:
             (leg_id, icao, reg, typ, dep, arr, dep_gnd, arr_gnd, npts,
-             off_ds, on_ds, is_tail, is_head) = r
+             off_ds, on_ds, is_tail, is_head, _is_dropout) = r
             if dep is not None and arr is not None:
                 complete.append((leg_id, icao, reg, typ, dep, arr,
                                  off_ds, on_ds, dep_gnd, arr_gnd, 0, npts))
@@ -162,6 +210,10 @@ def main():
             if not (0 <= gap_h <= a.max_gap_h):
                 rej_gap += 1; tails_left += 1; continue
             air_h = (h[10] - off_ds) / 10.0 / 3600.0
+            if air_h > a.max_air_h:
+                rej_air += 1; tails_left += 1; continue
+            # is_tail/is_head guarantee both endpoints, so this now always runs
+            # unless the tz table is missing the airport
             if dep in airports and h[5] in airports and air_h > 0:
                 d1, o1, _ = airports[dep]; d2, o2, _ = airports[h[5]]
                 kmh = gc_km(d1, o1, d2, o2) / air_h
@@ -214,7 +266,9 @@ def main():
     print(f"  {len(complete)} already complete")
     print(f"  {len(spliced)} spliced across a midnight boundary")
     print(f"  rejected: {rej_nopair} no pair, {rej_gap} gap > {a.max_gap_h} h, "
-          f"{rej_speed} implausible speed")
+          f"{rej_air} airborne > {a.max_air_h} h, {rej_speed} implausible speed")
+    print(f"  {dropouts} legs airborne at their last fix but > {a.max_gap_h} h "
+          f"from the boundary -- left coverage, never splice candidates")
     print(f"  {tails_left} tails and {heads_left} heads left unmatched"
           f"{' (emitted)' if a.keep_halves else ' (dropped)'}")
     if dates:

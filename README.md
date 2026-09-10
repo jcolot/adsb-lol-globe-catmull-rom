@@ -780,29 +780,60 @@ Tier 2 still answers these routes correctly, since the distance model needs no
 observed leg — but they then fall back to the model precisely where it is
 weakest, because wind asymmetry is largest on long-haul.
 
-Matching needs **no time tolerance**, because "the archive cut this leg" is
-exact: a *tail* is the aircraft's last leg of day D with `arr IS NULL` whose
-airborne run reaches the leg's final point (`t_on == t_end`), meaning it was
-still flying when the data stopped — a real landing leaves descent or ground
-fixes after `t_on`. A *head* is the mirror in day D+1. One tail and one head per
-aircraft per boundary makes the key unique, and since any flight under 24 h
-contains at most one 00:00Z, a leg is never cut into three.
+A *tail* is the aircraft's last leg of day D with `arr IS NULL` whose airborne
+run reaches the leg's final point (`t_on == t_end`), meaning it was still flying
+when the data stopped — a real landing leaves descent or ground fixes after
+`t_on`. A *head* is the mirror in day D+1. One of each per aircraft per boundary
+makes the key unique, and since any flight under 24 h contains at most one
+00:00Z, a leg is never cut into three.
 
-What the timestamps *cannot* do is confirm the match, which is why they are not
-used for it: over the North Atlantic the median cruise node gap is 2.7 h, so the
-last fix before midnight can sit hours short of it. Two independent checks
-instead — `--max-gap-h` (default 3.0, sized against that 2.7 h median) on the
-unobserved stretch, and a great-circle speed band on the spliced result, which
-catches a tail joined to an unrelated head without needing any position data.
+⚠️ **`t_on == t_end` is not by itself a midnight cut**, which an earlier version
+of this section wrongly claimed. It says only "still airborne at the last fix",
+and that is equally true of an aircraft that flew out of receiver coverage.
+Measured on 2026-09-08: of 11,768 legs matching it, only 31.8% had their last
+fix within an hour of the boundary and **42.4% were more than six hours from
+it** — coverage dropouts, not archive cuts. So a half must also be within
+`--max-gap-h` of the boundary. That does not change which pairs are accepted (a
+distant tail already fails the gap check), but it cut the misleading "no pair"
+count from 18,361 to 7,372 and moved 12,897 legs into a category that says what
+they are.
+
+Two more guards, both of which real data was needed to find:
+
+- **A half must carry the endpoint the splice recovers** — a tail needs a `dep`,
+  a head an `arr`. Splicing a dep-less tail onto an arr-less head yields a leg
+  with *neither* endpoint, useless downstream, and it silently skips the speed
+  check for want of airports to measure between. Those were the collapse-bug
+  aircraft: 472 of an apparent 1,312 splices, some spanning **48 hours**.
+- **`--max-air-h` (default 20).** The longest scheduled nonstop is ~19 h, so a
+  splice claiming more is wrong whatever distance it covers — and the speed band
+  does not catch them: a 45.6 h `KDSM->VHHH` splice worked out to 254 km/h,
+  comfortably inside it. This removed a further 152.
+
+Timestamps still do not *confirm* a match: over the North Atlantic the median
+cruise node gap is 2.7 h, so `--max-gap-h` is sized against that rather than
+against the cut, and a great-circle speed band checks the result without needing
+position data.
 
 | fixture | outcome |
 |---|---|
 | still airborne at 23:59Z, head next day | spliced |
 | complete leg | passes through |
 | tail whose aircraft never reappears | rejected, no pair |
-| last fix 20:30Z, head at 02:00Z | rejected, gap 5.5 h |
+| last fix 20:30Z (3.5 h out) | left coverage, not a candidate |
 | EGLL tail joined to an EHAM head after 8 h | rejected, 46 km/h |
+| a two-day collapsed leg pair | rejected, airborne > 20 h |
 | dates two apart (retention gap) | nothing spliced |
+
+**On one real pair of days** (2026-09-08 against 2026-09-09, 126,514 and 128,697
+legs): 763 legs spliced across the boundary, 12,897 set aside as coverage
+dropouts, and 7,372 tails that genuinely found no partner. The recovered legs
+look right — `VTBS->EHAM` 691 min, `CYYZ->CYVR` 281 min, `KDFW->KMIA` 171 min.
+Fitting the block model on the result gives `52.2 + 60*d/872` with a residual
+median of 8.7 min and p90 of 18.2 min, and the empirical table lands at 8,611
+directed routes: 7,900 same-day, 698 `+1`, 13 `+2`, in **70 KB of Parquet** —
+which is the sparse-matrix argument settled by measurement rather than
+estimate.
 
 Two consequences to plan around. A spliced leg spans two `base_ts` frames, so it
 has no single relative time frame: the output carries **absolute** deciseconds
