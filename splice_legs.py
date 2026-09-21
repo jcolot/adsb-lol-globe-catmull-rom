@@ -26,6 +26,11 @@ An aircraft has at most one tail and one head per boundary, so (icao, boundary)
 is a unique key. A flight under 24 h contains at most one 00:00Z, so a leg is
 never cut into three.
 
+The spliced leg's id is "<tail>+<head>", and since build_legs' leg_id now
+carries its own date (schema 4), that composite says which archive each half
+came from without the reader having to know. On partitions written before that,
+both halves read as "<icao>_<k>" and the dates are implicit in the inputs.
+
 What the timestamps CANNOT do is confirm the match, which is why they are not
 used for it. Over the North Atlantic the median node gap at cruise is 2.7 h
 (README), so the last fix before midnight can sit hours short of it and the

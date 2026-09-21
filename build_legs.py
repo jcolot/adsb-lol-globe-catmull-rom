@@ -14,9 +14,11 @@ Pipeline:
      nearest to its last (airports.csv, <=10 km). The anchor is a ground fix when
      the window has one, else the window's lowest fix, so airports with thin
      surface coverage still resolve;
-  4. write points_legs.parquet (one row/point, with dep/arr/leg_id), flights.parquet
-     (one row/leg = the index, sorted by dep), and airports/airport=XXXX/*.parquet
-     (each leg written under BOTH its dep and arr airport).
+  4. write points_legs.parquet (one row/point, with dep/arr/leg_id),
+     flights.parquet (one row/leg = the index, sorted by dep),
+     airports/airport=XXXX/*.parquet (each leg written under BOTH its dep and
+     arr airport, carrying that leg's row from the index), and legs_meta.json
+     (what schema this day was written with).
 
 flights.parquet times, in deciseconds past that leg's own base_ts:
   t_start/t_end  the LEG envelope -- includes half of each adjacent turnaround
@@ -29,18 +31,78 @@ flights.parquet times, in deciseconds past that leg's own base_ts:
   base_ts        absolute UTC seconds = base_ts + t/10. Needed because t is
                  per-aircraft relative and NOT comparable between aircraft.
 
+leg_id is "<date>_<icao>_<k>" and is GLOBALLY unique. It used to be
+"<icao>_<k>", with k restarting in every daily archive, so the same string
+named a different flight in each partition -- measured between 2026-09-08 and
+2026-09-09, 78,148 ids collided. Anything holding more than one day (a client
+spanning a local midnight, splice_legs matching a tail to a head, a cache keyed
+by id) had to carry the date alongside it and was silently wrong if it did not.
+The date is now IN the id, so the id alone is the key.
+
+The per-airport files carry base_ts, t_off, t_on, dep_gnd and arr_gnd from the
+leg index, so ONE request answers "which flights were at this airport between
+these two instants, and where did they fly?" -- absolute UTC is base_ts + t/10,
+and the wheels times are what a day-boundary filter has to cut on. Without them
+that question needed the 3.6 MB day-wide index as well, only to read five
+per-leg values. Denormalising them costs 1.41% (measured on a real EBBR
+partition: 715,536 -> 725,642 bytes over 69,308 rows), because each is constant
+across a leg's run of rows and RLE says so in a few bytes.
+
+legs_meta.json records flights_schema (bump it whenever a column is ADDED or
+its meaning changes) so a client reading a retained older partition can tell
+what it is looking at instead of feature-detecting column by column. It also
+records whether every aircraft shared one base_ts and what it was; today
+fit_spline gives the whole day a single epoch, but nothing here depends on
+that, and a client should read base_ts rather than assume it.
+
 Usage:  ./build_legs.py [--limit-aircraft N] [--traces PATH] [--meta PATH]
                         [--airports CSV] [--out-dir DIR]
 """
-import argparse, math, os, csv as csvmod
+import argparse, datetime as dt, json, math, os, csv as csvmod
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# Bumped whenever flights.parquet / the per-airport files gain a column or one
+# changes meaning, and written into legs_meta.json so a client can tell which
+# contract a retained partition was built under.
+#   1  leg_id, icao, reg, type, dep, arr, t_start, t_end, n_points
+#   2  + t_off, t_on, dep_gnd, arr_gnd, base_ts  (flights.parquet only)
+#   3  + those five in the per-airport files too, + legs_meta.json
+#   4  leg_id is "<date>_<icao>_<k>" -- globally unique, not just within a day
+FLIGHTS_SCHEMA = 4
+
+# What each per-airport row carries beyond the point itself. All five are
+# constant across a leg's run of rows, so RLE reduces them to a few bytes per
+# leg (+1.41% on a real EBBR partition) -- and they are exactly what turns the
+# file from "the geometry" into "the answer", with no second fetch of the
+# day-wide index to find out when the wheels came up.
+LEG_COLS = "p.*, l.base_ts, l.t_off, l.t_on, l.dep_gnd, l.arr_gnd"
 
 FLIGHT_MIN_KM = 2.0     # an airborne run must span this to count as a flight
 NEAR_KM = 10.0          # max distance from a fix to call it "at" an airport
 ENDPOINT_FRAC = 0.25    # search this much of the leg at each end for an anchor
 ENDPOINT_MIN_PTS = 5    # ...but always look at at least this many points
+
+
+def resolve_date(given, meta):
+    """The UTC date this run covers, which goes into every leg_id.
+
+    Taken from --date when given, else derived from base_ts -- fit_spline puts
+    the whole day on one epoch, so the aircraft table already knows the date.
+    Deriving it is refused when the epochs disagree, because then there is no
+    single date and a leg_id built from the wrong one is worse than a stopped
+    pipeline: it would collide with a real day's ids.
+    """
+    if given:
+        return dt.date.fromisoformat(given).isoformat()     # also validates
+    days = {dt.datetime.fromtimestamp(b, dt.timezone.utc).date().isoformat()
+            for _, _, b in meta.values() if b is not None}
+    if len(days) == 1:
+        return days.pop()
+    raise SystemExit(
+        f"cannot derive the data date from base_ts ({len(days)} distinct "
+        f"date(s) in the aircraft table) -- pass --date YYYY-MM-DD")
 
 
 def build_airport_index(path):
@@ -177,6 +239,10 @@ def main():
     ap.add_argument("--meta", default="prod-0-parquet-single/aircraft.parquet")
     ap.add_argument("--airports", default="airports.csv")
     ap.add_argument("--out-dir", default="airport_ds")
+    ap.add_argument("--date", metavar="YYYY-MM-DD",
+                    help="the UTC date this archive covers; it goes into every "
+                         "leg_id. Derived from the aircraft table's base_ts "
+                         "when omitted")
     ap.add_argument("--limit-aircraft", type=int, default=0)
     ap.add_argument("--airport-radius-km", dest="airport_radius", type=float,
                     default=0.0, help="if > 0, per-airport files keep only the "
@@ -202,6 +268,7 @@ def main():
               f"fit_spline.py to get one.")
         meta = {r[0]: (r[1], r[2], None) for r in con.execute(
             f"SELECT icao, reg, type FROM '{a.meta}'").fetchall()}
+    day = resolve_date(a.date, meta)
     resolve = make_resolver(build_airport_index(a.airports))
     os.makedirs(a.out_dir, exist_ok=True)
 
@@ -264,7 +331,7 @@ def main():
             # approach fix rather than a real wheels event -- filter on the flags.
             s_air, e_air = airs[k]
             t_off, t_on = ts[s_air], ts[e_air]
-            leg_id = f"{icao}_{k}"
+            leg_id = f"{day}_{icao}_{k}"
             for idx in range(i0, i1 + 1):
                 pbuf["icao"].append(icao); pbuf["t"].append(ts[idx])
                 pbuf["lat"].append(la[idx]); pbuf["lon"].append(lo[idx])
@@ -319,6 +386,9 @@ def main():
     }).sort_by("dep")
     pq.write_table(lt, os.path.join(a.out_dir, "flights.parquet"),
                    compression="zstd", use_dictionary=["dep", "arr", "type", "reg"])
+    # joined into every per-airport file below, so one fetch carries both the
+    # geometry and the five per-leg values a time query needs
+    con.register("legidx", lt)
 
     # per-airport files: each leg under BOTH dep and arr (hive-partitioned). With
     # --airport-radius-km > 0 the copy is CLIPPED to the airport's vicinity; by
@@ -340,17 +410,20 @@ def main():
             FROM read_csv_auto('{a.airports}')
             WHERE ident IS NOT NULL AND latitude_deg IS NOT NULL
         """)
-        dep_sel = (f"SELECT p.*, p.dep AS airport FROM '{pl_path}' p "
+        dep_sel = (f"SELECT {LEG_COLS}, p.dep AS airport FROM '{pl_path}' p "
+                   f"JOIN legidx l USING (leg_id) "
                    f"JOIN ap d ON p.dep = d.code WHERE p.dep IS NOT NULL "
                    f"AND km(d.lat, d.lon, p.lat / 1e5, p.lon / 1e5) < {a.airport_radius}")
-        arr_sel = (f"SELECT p.*, p.arr AS airport FROM '{pl_path}' p "
+        arr_sel = (f"SELECT {LEG_COLS}, p.arr AS airport FROM '{pl_path}' p "
+                   f"JOIN legidx l USING (leg_id) "
                    f"JOIN ap r ON p.arr = r.code WHERE p.arr IS NOT NULL "
                    f"AND p.arr <> p.dep "
                    f"AND km(r.lat, r.lon, p.lat / 1e5, p.lon / 1e5) < {a.airport_radius}")
     else:
-        dep_sel = (f"SELECT p.*, p.dep AS airport FROM '{pl_path}' p "
-                   f"WHERE p.dep IS NOT NULL")
-        arr_sel = (f"SELECT p.*, p.arr AS airport FROM '{pl_path}' p "
+        dep_sel = (f"SELECT {LEG_COLS}, p.dep AS airport FROM '{pl_path}' p "
+                   f"JOIN legidx l USING (leg_id) WHERE p.dep IS NOT NULL")
+        arr_sel = (f"SELECT {LEG_COLS}, p.arr AS airport FROM '{pl_path}' p "
+                   f"JOIN legidx l USING (leg_id) "
                    f"WHERE p.arr IS NOT NULL AND p.arr <> p.dep")
     # Single-thread this one write so every partition gets exactly ONE file
     # (data_0.parquet). DuckDB's parallel partitioned write otherwise has each
@@ -372,10 +445,36 @@ def main():
     n_air = con.execute(f"SELECT count(DISTINCT airport) FROM (SELECT dep AS airport "
                         f"FROM '{pl_path}' WHERE dep IS NOT NULL UNION SELECT arr "
                         f"FROM '{pl_path}' WHERE arr IS NOT NULL)").fetchone()[0]
+
+    # legs_meta.json: what this partition IS, so a client reading a retained
+    # older day can tell without probing every file's footer. flights_schema
+    # goes up whenever a column is added or changes meaning -- days written
+    # before this file existed have no legs_meta.json at all, which reads as
+    # schema 1 (no t_off/t_on, no ground flags, no base_ts).
+    bases = {x[12] for x in legs_rows}
+    uniform = len(bases) == 1 and None not in bases
+    epoch = next(iter(bases)) if uniform else None
+    meta_out = {
+        "flights_schema": FLIGHTS_SCHEMA,
+        "date": day,
+        # leg_id carries its date, so it is a key on its own across partitions
+        "leg_id_global": True,
+        "n_legs": len(legs_rows), "n_aircraft": ac, "n_airports": int(n_air),
+        "base_ts_uniform": uniform,
+        "t_epoch": epoch,
+        "t_epoch_iso": (dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+                        .isoformat().replace("+00:00", "Z")) if epoch else None,
+        "has_cusp": has_cusp,
+    }
+    with open(os.path.join(a.out_dir, "legs_meta.json"), "w") as f:
+        json.dump(meta_out, f, indent=1)
+
     print(f"\nDONE: {ac} aircraft, {len(legs_rows)} legs, {n_air} airports")
     print(f"  {pl_path}")
     print(f"  {os.path.join(a.out_dir,'flights.parquet')}  (leg index, sorted by dep)")
     print(f"  {apath}/airport=XXXX/*.parquet  (per-airport, fetch one at a time)")
+    print(f"  {os.path.join(a.out_dir,'legs_meta.json')}  (schema {FLIGHTS_SCHEMA}, "
+          f"base_ts {'uniform' if uniform else 'per-aircraft'})")
 
 
 if __name__ == "__main__":
