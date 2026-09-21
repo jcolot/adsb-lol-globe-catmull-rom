@@ -160,7 +160,11 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
 # 2. tracks.bin
 # ---------------------------------------------------------------------------
 def encode_chunk(lid, tds, lat, lon, alt, gnd, cusp, nb_lid):
-    """Encode one run of complete legs. Returns (payload, off, length) arrays.
+    """Encode one run of complete legs. Returns (payload, off, length, n_dup).
+
+    n_dup counts nodes that repeat the previous node's tds within a leg. Those
+    are the nodes whose order (lid, tds) alone does not pin down -- see the
+    tie-break in write_tracks. Reported so a zero here is evidence, not a guess.
 
     Deltas reset at every leg boundary, so each record decodes standalone from
     prev = 0. The four per-node streams are interleaved into ONE value array
@@ -184,6 +188,7 @@ def encode_chunk(lid, tds, lat, lon, alt, gnd, cusp, nb_lid):
     dt[first] = 0                       # t0 carries the absolute; dt[0] = 0
     if (dt < 0).any():
         raise ValueError("node timestamps not monotonic within a leg")
+    n_dup = int(((dt == 0) & ~first).sum())
 
     vals = np.empty(len(lid) * 4, dtype=np.uint64)
     vals[0::4] = dt.astype(np.uint64)
@@ -212,7 +217,8 @@ def encode_chunk(lid, tds, lat, lon, alt, gnd, cusp, nb_lid):
         offs.append(pos)
         lens.append(len(b))
         pos += len(b)
-    return b"".join(parts), np.array(offs, np.int64), np.array(lens, np.int64)
+    return (b"".join(parts), np.array(offs, np.int64),
+            np.array(lens, np.int64), n_dup)
 
 
 def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
@@ -232,7 +238,14 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
         FROM '{points}' p
         JOIN '{meta}' m USING (icao)
         JOIN leg l USING (leg_id)
-        ORDER BY l.lid, tds
+        -- (lid, tds) is NOT a total order: a leg can hold two nodes sharing a
+        -- tds, and then the tie is broken however the plan happens to emit it.
+        -- verify_bundle.py re-reads the same nodes through a different plan and
+        -- compares them positionally, so an unpinned tie shows up there as a
+        -- round-trip FAIL on a leg whose bytes are in fact fine. Sort on every
+        -- field that check compares, and both sides agree by construction.
+        ORDER BY l.lid, tds, p.lat, p.lon, p.alt,
+                 coalesce(p.on_ground, false){", coalesce(p.cusp, false)" if has_cusp else ""}
     """)
     reader = (res.to_arrow_reader(1_000_000)
               if hasattr(res, "to_arrow_reader")
@@ -243,10 +256,11 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
     held = 0
     base = 0            # byte offset of the next record in the file
     done = 0            # legs written
+    dup = 0             # nodes sharing a tds with the node before them
     t_start = time.time()
 
     def flush(final=False):
-        nonlocal held, base, done
+        nonlocal held, base, done, dup
         if not held:
             return
         arr = {c: np.concatenate(buf[c]) for c in cols}
@@ -271,7 +285,7 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
         else:
             held = 0
         n_here = int(lid[-1]) - int(lid[0]) + 1
-        payload, o, l = encode_chunk(
+        payload, o, l, n_dup = encode_chunk(
             lid, arr["tds"], arr["lat"], arr["lon"], arr["alt"],
             arr["gnd"].astype(bool), arr["cusp"].astype(bool),
             nb_lid[int(lid[0]):int(lid[0]) + n_here])
@@ -281,6 +295,7 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
         ln[sl] = l
         base += len(payload)
         done += n_here
+        dup += n_dup
         log(f"tracks: {done}/{n_legs} legs, {base/1e6:.1f} MB")
 
     with open(path, "wb") as fh:
@@ -293,6 +308,9 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
                 flush()
         flush(final=True)
 
+    if dup:
+        log(f"{dup} node(s) share a tds with their predecessor -- ordered by "
+            f"the (lat, lon, alt, gnd, cusp) tie-break")
     if done != n_legs:
         raise ValueError(f"wrote {done} legs, expected {n_legs}")
     # the records must tile the file exactly -- no gaps, no overlaps

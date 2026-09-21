@@ -180,11 +180,31 @@ overnight() {
         --emit-client "$OUT/legs" --date "$date" "${table_args[@]}"
 
     # the settled table belongs to the PREVIOUS partition, which this run's sync
-    # does not touch -- copy, never sync, or the prior day's files are deleted
+    # does not touch -- copy, never sync, or the prior day's files are deleted.
+    #
+    # NON-FATAL, for the same reason the grid write in upload() is: this copyto
+    # has never once succeeded. Every run that reached it got AccessDenied (403)
+    # from R2 three times and died under `set -e`, taking the whole upload phase
+    # with it -- so on those days the day partition itself never shipped. The
+    # runs that went green only did so because D-1 had no leg index in R2 and
+    # the splice was skipped entirely. A settled table we cannot write costs
+    # D-1 its overnight column; aborting here costs D everything. The 403 is a
+    # separate, open problem -- see the grid-write probe in upload().
     if [ -s "$WORK/overnight/overnight.parquet" ] && [ -n "${R2_BUCKET:-}" ]; then
-        rclone copyto "$WORK/overnight/overnight.parquet" \
-            "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/overnight.parquet" --checksum
-        echo "settled overnight table -> date=$prev/overnight.parquet"
+        if rclone copyto "$WORK/overnight/overnight.parquet" \
+               "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/overnight.parquet" --checksum; then
+            echo "settled overnight table -> date=$prev/overnight.parquet"
+        else
+            echo "WARNING: could not write date=$prev/overnight.parquet" >&2
+            echo "  date=$prev keeps the leg index it already has; only its" >&2
+            echo "  settled overnight column is missing." >&2
+            # a plain `[ ... ] && echo` here would return 1 when not on CI,
+            # and this is the last command in the function -- `set -e` would
+            # kill the run over exactly the failure we just swallowed
+            if [ -n "${GITHUB_ACTIONS:-}" ]; then
+                echo "::warning title=Overnight table upload failed::overnight.parquet was not written to date=$prev - that day's settled overnight column is missing, but the pipeline is otherwise complete"
+            fi
+        fi
     fi
 }
 
