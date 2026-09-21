@@ -40,14 +40,37 @@ Base: `https://pub-135f2252a0074f0b9761b0dc93a75fa5.r2.dev/legs`
 
 ```
 /dates.json                     {"dates":[...], "latest":"2026-09-20"}
-/date=<DATE>/meta.json          units, counts, t_epoch, index_res
-/date=<DATE>/legs.parquet       4.6 MB  one row per leg   -- LOAD WHOLE
-/date=<DATE>/cells.bin         15.3 MB  (H3, hour) -> legs     -- LOAD WHOLE
-/date=<DATE>/tracks.bin        94.0 MB  node geometry     -- RANGE-READ ONLY
+/date=<DATE>/meta.json          units, counts, t_epoch, index_res, buckets
+/date=<DATE>/legs.parquet       4.6 MB  one row per leg    -- load whole
+/date=<DATE>/cells.bin         15.3 MB  (H3, hour) -> legs -- either (see below)
+/date=<DATE>/tracks.bin        94.0 MB  node geometry      -- RANGE-READ ONLY
 ```
 
-Load `meta.json` + `legs.parquet` + `cells.bin` once per day: **12.9 MB
-resident**, and after that every cell query is local until you need geometry.
+`tracks.bin` is the only file you must never fetch whole. `legs.parquet` you do
+fetch whole — `lid` indexes it directly and the rows you need are scattered
+through it. **`cells.bin` is your choice**, and the tradeoff is real:
+
+| | load whole | range-read per res-0 cell |
+|---|---|---|
+| up front | 15.3 MB (v1 day: 8.3 MB) | nothing |
+| first click in a region | 0 requests | 22.5 KB, ~5 requests |
+| each further click there | 0 requests, instant | 2.4 KB, ~3 requests |
+| a click in a new region | 0 requests | another 22.5 KB |
+| whole-world view | already have it | would fetch most of the file anyway |
+
+**Load whole if the view is the globe, or if the user will roam.** One fetch and
+then every cell, every hour, every region answers locally with no request and no
+latency — which for a click-to-explore interaction is a better experience than
+paying a round trip per click, and 15.3 MB is one cacheable object.
+
+**Range-read if the view opens on a region** and you want the first answer before
+15 MB has landed. The res-0 directory is what makes that possible: every res-0
+cell's descendants are one contiguous run, so a region is a handful of ranges.
+See **Version transition** — a v1 day has no directory, so it is load-whole only.
+
+With `meta.json` + `legs.parquet` + `cells.bin` resident that is **19.9 MB for a
+v4 day** and **12.8 MB for a v1 day**, after which every cell query is local
+until you need geometry.
 
 Key facts from `meta.json`, all of which you should read rather than hardcode:
 
