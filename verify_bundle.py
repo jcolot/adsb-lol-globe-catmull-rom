@@ -253,7 +253,10 @@ def main():
     for row in con.execute("""
             SELECT s.leg_id, s.tds, s.lat, s.lon, s.alt, s.gnd, s.cusp
             FROM src s SEMI JOIN pick USING (leg_id)
-            ORDER BY s.leg_id, s.tds""").fetchall():
+            -- must match build_bundle.py's node order exactly, including the
+            -- tie-break: (leg_id, tds) alone lets two nodes sharing a tds come
+            -- back in either order, and this comparison is positional
+            ORDER BY s.leg_id, s.tds, s.lat, s.lon, s.alt, s.gnd, s.cusp""").fetchall():
         by_leg.setdefault(row[0], []).append(row[1:])
 
     bad_nodes = bad_count = bad_bbox = bad_t = 0
