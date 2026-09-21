@@ -88,45 +88,130 @@ def decode_track(buf):
 
 class CellIndex:
     """cells.bin reader. The whole file is resident, so a lookup is a binary
-    search over cell[] and a slice of post[]."""
+    search over cell[] and a slice of post[].
+
+    v2 added a time dimension: a cell owns a run of GROUPS, one per time bucket
+    it saw traffic in, and each group has its own posting list. Bucket b covers
+    [b * bucket_ds, (b+1) * bucket_ds) deciseconds from meta.t_epoch. The WIDTH
+    is fixed and the COUNT follows the data span, so n_buckets is 24 for a single
+    UTC day and larger for a stitched multi-day input -- do not assume a day.
+    bucket_ds is in the header for exactly that reason. v1 files still read --
+    they are treated as a single bucket spanning the day.
+    """
 
     def __init__(self, blob):
         if blob[:8] != MAGIC:
             raise ValueError("bad magic")
-        self.version, self.res, _, self.n_cells, self.n_legs = \
-            struct.unpack_from("<BBHII", blob, 8)
-        o = 20
-        self.cells = list(struct.unpack_from(f"<{self.n_cells}Q", blob, o))
-        o += 8 * self.n_cells
-        self.off = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
-        o += 4 * (self.n_cells + 1)
+        self.version = blob[8]
+        if self.version == 1:
+            self.res, _, self.n_cells, self.n_legs = \
+                struct.unpack_from("<BHII", blob, 9)
+            self.n_buckets, self.n_groups = 1, self.n_cells
+            self.bucket_ds = 86400 * 10
+            o = 20
+            self.cells = list(struct.unpack_from(f"<{self.n_cells}Q", blob, o))
+            o += 8 * self.n_cells
+            # one group per cell, so the group table is the identity
+            self.goff = list(range(self.n_cells + 1))
+            self.bkt = [0] * self.n_cells
+            self.poff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
+            o += 4 * (self.n_cells + 1)
+            self.coff = self.poff[:-1] + [self.poff[-1]]
+        elif self.version == 2:
+            self.res, self.n_buckets, _, self.n_cells, self.n_legs, \
+                self.n_groups, self.bucket_ds = \
+                struct.unpack_from("<BBBIIII", blob, 9)
+            # "<BBBBIIII" after the 8-byte magic is 20 bytes with no padding,
+            # so the tables start at 28.
+            o = 28
+            self.cells = list(struct.unpack_from(f"<{self.n_cells}Q", blob, o))
+            o += 8 * self.n_cells
+            self.goff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
+            o += 4 * (self.n_cells + 1)
+            self.coff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
+            o += 4 * (self.n_cells + 1)
+            self.bkt = list(struct.unpack_from(f"<{self.n_groups}B", blob, o))
+            o += self.n_groups
+            # per-group posting LENGTHS as varints; rebuild the flat prefix
+            # offsets the old format stored outright. Each cell restarts from
+            # its own coff[], so a corrupt length cannot walk off into the
+            # next cell's postings unnoticed -- the structure check below
+            # compares the two.
+            glen = []
+            for _g in range(self.n_groups):
+                v, o = read_varint(blob, o)
+                glen.append(v)
+            base = o
+            self.poff = [0] * (self.n_groups + 1)
+            for i in range(self.n_cells):
+                pos = self.coff[i]
+                for g in range(self.goff[i], self.goff[i + 1]):
+                    self.poff[g] = pos
+                    pos += glen[g]
+                self.poff[self.goff[i + 1]] = pos
+            o = base
+        else:
+            raise ValueError(f"cells.bin version {self.version} not supported")
         self.post = blob[o:]
 
-    def get(self, cell):
-        """Ascending lid list for one cell, or [] if the cell has no traffic."""
+    def _find(self, cell):
         lo, hi = 0, self.n_cells - 1
         while lo <= hi:
             mid = (lo + hi) // 2
             if self.cells[mid] == cell:
-                break
+                return mid
             if self.cells[mid] < cell:
                 lo = mid + 1
             else:
                 hi = mid - 1
-        else:
-            return []
-        i, end = self.off[mid], self.off[mid + 1]
+        return -1
+
+    def _decode(self, g):
+        i, end = self.poff[g], self.poff[g + 1]
         out, cur = [], 0
         while i < end:
-            g, i = read_varint(self.post, i)
-            cur += g
+            gap, i = read_varint(self.post, i)
+            cur += gap
             out.append(cur)
         return out
 
-    def query(self, cells):
+    def get(self, cell, ds0=None, ds1=None):
+        """Ascending lids for one cell, or [] if the cell has no traffic.
+
+        With ds0/ds1 (deciseconds from t_epoch, inclusive) only the buckets
+        overlapping that window are read. The window is CLAMPED into the day the
+        same way build_bundle clamps a node's bucket, so a leg parked outside the
+        nominal day still answers for the edge buckets.
+        """
+        at = self._find(cell)
+        if at < 0:
+            return []
+        g0, g1 = self.goff[at], self.goff[at + 1]
+        if ds0 is None:
+            out = set()
+            for g in range(g0, g1):
+                out.update(self._decode(g))
+            return sorted(out)
+        b0 = min(self.n_buckets - 1, max(0, int(ds0 // self.bucket_ds)))
+        b1 = min(self.n_buckets - 1, max(0, int(ds1 // self.bucket_ds)))
+        out = set()
+        for g in range(g0, g1):
+            if b0 <= self.bkt[g] <= b1:
+                out.update(self._decode(g))
+        return sorted(out)
+
+    def buckets_of(self, cell):
+        """(bucket, lids) for each time bucket this cell saw traffic in."""
+        at = self._find(cell)
+        if at < 0:
+            return []
+        return [(self.bkt[g], self._decode(g))
+                for g in range(self.goff[at], self.goff[at + 1])]
+
+    def query(self, cells, ds0=None, ds1=None):
         s = set()
         for c in cells:
-            s.update(self.get(c))
+            s.update(self.get(c, ds0, ds1))
         return s
 
 
@@ -175,13 +260,52 @@ def main():
           len(legs) == meta["n_legs"], f"{len(legs)}")
     check("lid == row index",
           all(r["lid"] == i for i, r in enumerate(legs)))
-    check("cells.bin magic + version", idx.version == 1 and idx.res == meta["index_res"])
+    check("cells.bin magic + version",
+          idx.version == bb.IDX_VERSION and idx.res == meta["index_res"])
     check("cells.bin n_legs matches", idx.n_legs == meta["n_legs"])
+    check("cells.bin bucket width + count match meta",
+          idx.n_buckets == meta["index_buckets"]
+          and idx.bucket_ds == meta["bucket_ds"],
+          f"{idx.n_buckets} x {idx.bucket_ds/600:.0f} min")
+    # the count must cover the span -- this is what a per-day count got wrong
+    span = max(r["t1"] for r in legs) if legs else 0
+    # >=, not >: the top edge is folded into the last bucket by the builder's
+    # clamp, so a span of exactly 24 h is covered by exactly 24 hourly buckets.
+    check("bucket count covers the data span",
+          idx.n_buckets * idx.bucket_ds >= span,
+          f"span {span/864000:.2f} days, buckets reach "
+          f"{idx.n_buckets * idx.bucket_ds/864000:.2f}")
+    check("the last bucket is not a dumping ground",
+          idx.n_buckets == 1 or
+          sum(1 for b in idx.bkt if b == idx.n_buckets - 1)
+          <= 3 * max(1, idx.n_groups // idx.n_buckets),
+          f"{sum(1 for b in idx.bkt if b == idx.n_buckets - 1)} groups in the "
+          f"last bucket vs {idx.n_groups // max(idx.n_buckets,1)} average")
+    check("cells.bin group count matches meta",
+          idx.n_groups == meta["index_groups"], f"{idx.n_groups}")
     check("cells ascending, no duplicates",
           all(idx.cells[i] < idx.cells[i + 1] for i in range(len(idx.cells) - 1)))
+    check("group offsets monotonic and cover every group",
+          all(idx.goff[i] <= idx.goff[i + 1] for i in range(len(idx.goff) - 1))
+          and idx.goff[-1] == idx.n_groups and idx.goff[0] == 0)
+    check("every cell owns at least one group",
+          all(idx.goff[i] < idx.goff[i + 1] for i in range(idx.n_cells)))
+    check("buckets in range, ascending with no repeats inside a cell",
+          all(all(0 <= idx.bkt[g] < idx.n_buckets for g in
+                  range(idx.goff[i], idx.goff[i + 1]))
+              and all(idx.bkt[g] < idx.bkt[g + 1] for g in
+                      range(idx.goff[i], idx.goff[i + 1] - 1))
+              for i in range(idx.n_cells)))
     check("posting offsets monotonic and cover post[]",
-          all(idx.off[i] <= idx.off[i + 1] for i in range(len(idx.off) - 1))
-          and idx.off[-1] == len(idx.post))
+          all(idx.poff[i] <= idx.poff[i + 1] for i in range(len(idx.poff) - 1))
+          and idx.poff[-1] == len(idx.post),
+          f"{idx.poff[-1]} vs {len(idx.post)}")
+    check("per-cell posting base agrees with its first group's offset",
+          all(idx.coff[i] == idx.poff[idx.goff[i]] for i in range(idx.n_cells)))
+    check("every posting list is non-empty and ascending",
+          all(len(p) > 0 and all(p[k] < p[k + 1] for k in range(len(p) - 1))
+              and p[-1] < idx.n_legs
+              for p in (idx._decode(g) for g in range(idx.n_groups))))
     check("file sizes match meta",
           all(os.path.getsize(os.path.join(a.bundle, v["path"])) == v["bytes"]
               for v in meta["files"].values()))
@@ -341,19 +465,123 @@ def main():
               f"-- expected: res {res} cells are ~"
               f"{2 * bb.H3_EDGE_KM[res]:.1f} km across)")
 
+    # ---- 4b. the same, but with a TIME window ----------------------------
+    # This is what the bucket dimension exists for, so it is also where a bug
+    # in it would show up: a leg whose node is in the box during the window and
+    # is NOT returned is a silent wrong answer in the frontend.
+    if idx.n_buckets > 1:
+        fn_t = ans_t = gt_t = span_t = tested_t = 0
+        worst_t = None
+        for _ in range(a.boxes):
+            span = rng.choice([1.0, 3.0, 10.0, 25.0])
+            w = rng.uniform(lo0, max(lo0, lo1 - span))
+            sy = rng.uniform(la0, max(la0, la1 - span))
+            e, n = w + span, sy + span
+            # windows from 15 min to 3 h, aligned anywhere in the bundle's
+            # span -- NOT anywhere in "the day". A stitched bundle is longer
+            # than a day, and hardcoding 86400 s here silently stops testing
+            # the second half of it.
+            wid = rng.choice([9000, 36000, 108000])
+            full = idx.n_buckets * idx.bucket_ds
+            ds0 = rng.randrange(0, max(1, full - wid))
+            ds1 = ds0 + wid
+            truth = {r[0] for r in con.execute(f"""
+                SELECT DISTINCT l.lid
+                FROM src s JOIN leg l USING (leg_id)
+                WHERE s.lat BETWEEN {sy * qpos} AND {n * qpos}
+                  AND s.lon BETWEEN {w * qpos} AND {e * qpos}
+                  AND s.tds BETWEEN {ds0} AND {ds1}
+            """).fetchall()}
+            if not truth:
+                continue
+            cover_cells = cover(w, sy, e, n)
+            ans = idx.query(cover_cells, ds0, ds1)
+            # what the caller would have had to accept WITHOUT the buckets:
+            # every leg in those cells whose whole span overlaps the window
+            span_ans = {l for l in idx.query(cover_cells)
+                        if legs[l]["t0"] <= ds1 and legs[l]["t1"] >= ds0}
+            missing = truth - ans
+            tested_t += 1
+            gt_t += len(truth)
+            ans_t += len(ans)
+            span_t += len(span_ans)
+            fn_t += len(missing)
+            if missing and worst_t is None:
+                worst_t = (w, sy, e, n, ds0, ds1, sorted(missing)[:5])
+        check(f"no false negatives across {tested_t} box+window queries",
+              fn_t == 0,
+              f"{fn_t} legs missed" + (f" e.g. {worst_t}" if worst_t else ""))
+        if tested_t:
+            print(f"        ground truth {gt_t} legs; bucketed index returned "
+                  f"{ans_t}, leg-span prune alone would return {span_t} "
+                  f"({span_t / max(ans_t, 1):.1f}x more to range-read)")
+
     # a leg's own cells must contain its nodes' cells
     sample = rng.sample(range(len(legs)), min(400, len(legs)))
     con.execute("CREATE TABLE pick2(lid INTEGER)")
     con.executemany("INSERT INTO pick2 VALUES (?)", [(int(i),) for i in sample])
     pairs = con.execute(f"""
         SELECT DISTINCT l.lid,
-               h3_latlng_to_cell(p.lat/{qpos}.0, p.lon/{qpos}.0, {res}) AS cell
-        FROM '{a.points}' p JOIN leg l USING (leg_id) SEMI JOIN pick2 USING (lid)
+               h3_latlng_to_cell(s.lat/{qpos}.0, s.lon/{qpos}.0, {res}) AS cell,
+               s.tds AS tds
+        FROM src s JOIN leg l USING (leg_id) SEMI JOIN pick2 USING (lid)
     """).fetchall()
-    miss = sum(1 for lid, cell in pairs if lid not in idx.get(cell))
+    miss = sum(1 for lid, cell, _ in pairs if lid not in idx.get(cell))
     check(f"every node's own cell posts its leg "
           f"({len(sample)} legs, {len(pairs)} node cells)", miss == 0,
           f"{miss} missing")
+    # and in the bucket that node's own timestamp falls in -- the bucket
+    # assignment has to agree with the timeline legs.parquet/meta.json publish
+    miss_b = sum(1 for lid, cell, tds in pairs
+                 if lid not in idx.get(cell, tds, tds))
+    check("every node's own (cell, bucket) posts its leg", miss_b == 0,
+          f"{miss_b} missing")
+
+    # ---- 4c. no interior time holes --------------------------------------
+    # Two CONSECUTIVE nodes in the same cell bracket an interval the aircraft
+    # provably spent inside it, so every bucket in between must be posted. This
+    # is the check that catches bucketing each sample on its own timestamp,
+    # which is the obvious implementation and leaves holes HOURS wide: the
+    # densifier samples by distance, so a parked aircraft is hardly sampled in
+    # time at all. Measured before the fix, one leg sat in the Brussels cell
+    # from 06:25 to 21:05 and was posted in buckets 6, 20 and 21 only.
+    #
+    # Nodes are used rather than a resampled curve on purpose -- a resample
+    # would disagree with the builder's Catmull-Rom sampling over a cell edge
+    # and make this check flaky about the thing it is not testing.
+    if idx.n_buckets > 1:
+        rows = con.execute(f"""
+            SELECT l.lid, s.tds,
+                   h3_latlng_to_cell(s.lat/{qpos}.0, s.lon/{qpos}.0, {res}) AS cell
+            FROM src s JOIN leg l USING (leg_id) SEMI JOIN pick2 USING (lid)
+            ORDER BY l.lid, s.tds
+        """).fetchall()
+        bmap = {}
+        def posted(cell):
+            if cell not in bmap:
+                bmap[cell] = {b: set(ls) for b, ls in idx.buckets_of(cell)}
+            return bmap[cell]
+        def bkt(tds):
+            return min(idx.n_buckets - 1, max(0, int(tds) // idx.bucket_ds))
+        holes = spans = 0
+        worst = None
+        for (lid_a, t_a, c_a), (lid_b, t_b, c_b) in zip(rows, rows[1:]):
+            if lid_a != lid_b or c_a != c_b:
+                continue
+            spans += 1
+            pb = posted(c_a)
+            for b in range(bkt(t_a), bkt(t_b) + 1):
+                if lid_a not in pb.get(b, ()):
+                    holes += 1
+                    if worst is None:
+                        worst = (lid_a, f"{c_a:#x}", b,
+                                 f"{t_a/36000:.2f}-{t_b/36000:.2f}h")
+                    break
+        check(f"no bucket holes between same-cell consecutive nodes "
+              f"({spans} node pairs)", holes == 0,
+              f"{holes} holes" + (f" e.g. lid {worst[0]} cell {worst[1]} "
+                                  f"bucket {worst[2]} over {worst[3]}"
+                                  if worst else ""))
 
     print()
     if fail:

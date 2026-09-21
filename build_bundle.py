@@ -5,7 +5,7 @@ make every flight findable and every "what flew through this box?" answerable.
 
     meta.json      manifest: units, counts, file sizes
     legs.parquet   one row per leg -- SHIPPED WHOLE, held in memory
-    cells.bin      H3 inverted index, cell -> legs -- SHIPPED WHOLE
+    cells.bin      H3 inverted index, (cell, hour) -> legs -- SHIPPED WHOLE
     tracks.bin     per-leg delta-varint node records -- RANGE-READ
 
 The design turns on one observation: the two queries want different structures,
@@ -28,7 +28,7 @@ raw `t` is not comparable between flights. This joins aircraft.parquet to get
 base_ts and rebases everything on one epoch (meta.json/t_epoch), after which
 t0/t1 are directly comparable day-relative deciseconds.
 """
-import argparse, datetime, importlib.util, json, os, struct, sys, time
+import argparse, datetime, importlib.util, json, math, os, struct, sys, time
 
 import numpy as np
 import pyarrow as pa
@@ -54,8 +54,9 @@ def _arrow(rel):
 
 
 MAGIC = b"ADSBIDX1"
-IDX_VERSION = 1
+IDX_VERSION = 2                 # 2 added the time-bucket dimension to cells.bin
 Q_POS = 1e5                     # points_legs lat/lon are degrees * 1e5
+DAY_DS = 86400 * 10             # deciseconds in a day -- the bucketing domain
 
 # H3 average edge length in km, by resolution -- the sample step must stay well
 # under this or a leg could skip a cell entirely
@@ -124,7 +125,8 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
             SELECT p.leg_id, p.icao, p.dep, p.arr, p.reg, p.type,
                    p.lat, p.lon, p.alt, p.t,
                    -- rebase per-aircraft t onto one epoch
-                   (p.t::BIGINT + m.base_ts::BIGINT * 10 - {epoch_ds}) AS tds
+                   (p.t::BIGINT + m.base_ts::BIGINT * 10 - {epoch_ds}) AS tds,
+                   (m.base_ts::BIGINT * 10 - {epoch_ds}) AS t_shift
             FROM '{points}' p JOIN '{meta}' m USING (icao)
         ), agg AS (
             SELECT leg_id,
@@ -132,6 +134,9 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                    any_value(arr) AS arr,  any_value(reg) AS reg,
                    any_value(type) AS type,
                    count(*)::INTEGER AS n_nodes,
+                   -- constant within a leg (one leg is one aircraft); lets the
+                   -- densifier's per-aircraft t be rebased with a single join
+                   any_value(t_shift) AS t_shift,
                    min(tds) AS t0, max(tds) AS t1,
                    min(lat) AS min_lat, max(lat) AS max_lat,
                    min(lon) AS min_lon, max(lon) AS max_lon,
@@ -147,7 +152,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                              CASE WHEN dep IS NULL THEN anchor ELSE 0::UBIGINT END,
                              t0, leg_id) - 1)::INTEGER AS lid,
                leg_id, icao, dep, arr, reg, type, n_nodes,
-               t0::BIGINT AS t0, t1::BIGINT AS t1,
+               t0::BIGINT AS t0, t1::BIGINT AS t1, t_shift,
                min_lat, max_lat, min_lon, max_lon, min_alt, max_alt, anchor
         FROM agg
     """)
@@ -325,58 +330,165 @@ def write_tracks(con, points, meta, path, epoch_ds, n_legs, has_cusp,
 # ---------------------------------------------------------------------------
 # 3. cells.bin
 # ---------------------------------------------------------------------------
-def write_cells(con, points, path, index_res, step_km, buckets, has_cusp, log):
-    """H3 inverted index: cell -> gap-coded ascending lid list.
+def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
+                bucket_ds, log):
+    """H3 inverted index: (cell, time bucket) -> gap-coded ascending lid list.
 
-    Sorted ascending by H3 index, which is the right key here: a parent's
-    descendants form exactly ONE contiguous run in that order, so "everything
-    under this cell" is a single slice and the client can pick its covering
-    resolution by zoom.
+    Cells are sorted ascending by H3 index, which is the right key here: a
+    parent's descendants form exactly ONE contiguous run in that order, so
+    "everything under this cell" is a single slice and the client can pick its
+    covering resolution by zoom. Within a cell, groups ascend by bucket.
+
+    WHY THE TIME DIMENSION. Without it a cell query can only be pruned by each
+    leg's [t0, t1] span, and that span is the whole flight while its time inside
+    one res-4 cell is minutes. Measured on 2026-09-20, asking "who was in this
+    cell during a 15-minute window" and pruning on the leg span alone
+    over-reports by 8.1x over Brussels, 7.2x over Heathrow and 24.1x for an
+    enroute cell over the Alps -- worst exactly where the question is most
+    interesting. The client's only recourse was to range-read tracks.bin for
+    every candidate and re-test the geometry. One byte of bucket per group
+    removes that round trip for any window that aligns to the bucket grid.
+
+    Buckets are a fixed WIDTH from meta.t_epoch, and the count follows the data:
+    bucket b covers [b * bucket_ds, (b+1) * bucket_ds) deciseconds, and there are
+    as many as the span needs. The width is the parameter, not the count.
+
+    That distinction is not pedantic. Defining "24 buckets per day" looks
+    equivalent and breaks the moment the input is a stitched glob over two
+    releases -- which is exactly what splice_legs.py produces, since a flight
+    airborne at 00:00Z is cut in half by the archive boundary. With a per-day
+    count every hour past the 24th clamps into the last bucket: measured on a
+    synthetic two-day stitch, bucket 23 held 30% of all groups against ~750 for
+    its neighbours, a bin holding 25 hours of traffic. No false negatives, and no
+    resolution either, for half the input. Deriving the count from the span gives
+    that stitch 48 real hourly buckets instead.
+
+    A local day is a span like this for most of the world: Los Angeles runs
+    07:00Z to 07:00Z, so anything organised around local operations crosses the
+    UTC boundary and lands here.
     """
-    con.execute("CREATE OR REPLACE TABLE pair (cell UBIGINT, lid INTEGER)")
+    max_ds = con.execute("SELECT max(t1) FROM leg").fetchone()[0] or 0
+    # ceil, not floor+1: a node landing exactly on the top edge (a fix at
+    # precisely 00:00:00Z) would otherwise open a whole extra bucket to hold one
+    # instant -- measured, a 25th bucket with 62 groups in it on a real day. The
+    # clamp in bkt_of folds that edge into the last bucket instead, so a single
+    # UTC day is exactly 24 hourly buckets and a two-day stitch is exactly 48.
+    n_buckets = max(1, math.ceil(int(max_ds) / int(bucket_ds)))
+    if n_buckets > 255:
+        sys.exit(f"span {int(max_ds)/864000:.1f} days at {bucket_ds/600:.0f} min "
+                 f"per bucket needs {n_buckets} buckets; bucket[] is uint8, so "
+                 f"the limit is 255 -- widen --bucket-minutes")
+    con.execute(f"""
+        CREATE OR REPLACE MACRO bkt_of(x) AS
+            least({n_buckets - 1}, greatest(0, floor(x / {bucket_ds}::DOUBLE)::BIGINT))
+    """)
+    con.execute("CREATE OR REPLACE TABLE pair "
+                "(cell UBIGINT, bkt UTINYINT, lid INTEGER)")
     for b in range(buckets):
         sql = bh.densify_sql(points, has_cusp, step_km, 4096, b, buckets, 0)
+        # s.t is deciseconds past the AIRCRAFT's base_ts; l.t_shift rebases it
+        # onto meta.t_epoch, the same timeline as legs.parquet t0/t1.
+        #
+        # EACH SAMPLE CLAIMS THE BUCKETS OUT TO ITS NEIGHBOURS IN TIME, not just
+        # the one its own timestamp lands in. Bucketing per sample looks right
+        # and is badly wrong, because the densifier samples by DISTANCE: a
+        # stationary aircraft is barely sampled in time at all. Measured on
+        # 2026-09-20 before this fix, a leg parked in the Brussels cell from
+        # 06:25 to 21:05 was posted in buckets 6, 20 and 21 only -- a fourteen
+        # hour hole in which any query missed it. The same defect at the other
+        # extreme is one sample interval wide: a leg whose last in-cell sample
+        # sat at 11:59:28 was absent from the 12:00 bucket although it was still
+        # in the cell at 12:00:42.
+        #
+        # Claiming out to the neighbours fixes both with one rule and no
+        # threshold. Between two consecutive samples the curve moves at most
+        # ~step_km, so an aircraft sampled inside a ~45 km cell was inside it
+        # for that whole interval; where the neighbour lies outside the cell the
+        # claim over-reaches by at most one sample interval, which buys a false
+        # positive and never a false negative -- the direction this index is
+        # allowed to err in.
         con.execute(f"""
             INSERT INTO pair
-            SELECT DISTINCT h3_latlng_to_cell(s.lat, s.lon, {index_res}) AS cell,
-                            l.lid AS lid
-            FROM ({sql}) s JOIN leg l USING (leg_id)
+            WITH d AS (
+                SELECT h3_latlng_to_cell(s.lat, s.lon, {index_res}) AS cell,
+                       l.lid AS lid, (s.t + l.t_shift) AS tds
+                FROM ({sql}) s JOIN leg l USING (leg_id)
+            ), nb AS (
+                SELECT cell, lid,
+                       coalesce(lag(tds)  OVER q, tds) AS t_prev,
+                       coalesce(lead(tds) OVER q, tds) AS t_next
+                FROM d WINDOW q AS (PARTITION BY lid ORDER BY tds)
+            )
+            SELECT DISTINCT cell, bkt::UTINYINT, lid FROM (
+                SELECT cell, lid,
+                       unnest(range(bkt_of(t_prev), bkt_of(t_next) + 1)) AS bkt
+                FROM nb
+            )
         """)
         log(f"cells: bucket {b+1}/{buckets}, "
             f"{con.execute('SELECT count(*) FROM pair').fetchone()[0]} pairs")
 
-    t = _arrow(con.execute("SELECT cell, lid FROM pair ORDER BY cell, lid"))
+    t = _arrow(con.execute("SELECT cell, bkt, lid FROM pair ORDER BY cell, bkt, lid"))
     cell = t.column("cell").to_numpy(zero_copy_only=False).astype(np.uint64)
+    bkt = t.column("bkt").to_numpy(zero_copy_only=False).astype(np.uint8)
     lid = t.column("lid").to_numpy(zero_copy_only=False).astype(np.int64)
     if not len(cell):
-        sys.exit("no (cell, leg) pairs -- nothing to index")
+        sys.exit("no (cell, bucket, leg) triples -- nothing to index")
 
-    starts = np.concatenate(([0], np.flatnonzero(np.diff(cell)) + 1))
-    ucell = cell[starts]
-    # gap-code ascending lids within each cell; first of each cell is absolute
+    # group = one (cell, bucket); cell = a run of consecutive groups
+    gstarts = np.concatenate(
+        ([0], np.flatnonzero((cell[1:] != cell[:-1]) | (bkt[1:] != bkt[:-1])) + 1))
+    gcell, gbkt = cell[gstarts], bkt[gstarts]
+    cstarts = np.concatenate(([0], np.flatnonzero(gcell[1:] != gcell[:-1]) + 1))
+    ucell = gcell[cstarts]
+    goff = np.concatenate((cstarts, [len(gstarts)])).astype(np.uint32)
+
+    # gap-code ascending lids within each GROUP; first of each group is absolute
     gap = lid - np.concatenate(([0], lid[:-1]))
-    gap[starts] = lid[starts]
+    gap[gstarts] = lid[gstarts]
     if (gap < 0).any():
-        raise ValueError("posting lists not ascending")
+        raise ValueError("posting lists not ascending within a group")
     post, nb = varint_encode(gap.astype(np.uint64))
 
-    # per-cell byte length -> prefix offsets
     nb_cum = np.concatenate(([0], np.cumsum(nb)))
-    off = nb_cum[np.concatenate((starts, [len(lid)]))].astype(np.uint32)
-    if int(off[-1]) != len(post):
+    poff = nb_cum[np.concatenate((gstarts, [len(lid)]))].astype(np.uint32)
+    if int(poff[-1]) != len(post):
         raise ValueError("posting offsets disagree with buffer length")
+    if int(goff[-1]) != len(gstarts):
+        raise ValueError("group offsets disagree with the group count")
+
+    # Groups are small -- a few pairs, ~9 bytes of postings each -- so a uint32
+    # prefix offset PER GROUP is the single most expensive thing in the file: at
+    # hourly granularity that table alone was 4.5 MB of a 17.7 MB index, more
+    # than a third of it, to describe 10 MB of payload. Ship a uint32 byte
+    # offset per CELL plus a varint length per group instead, and let the reader
+    # prefix-sum the lengths it needs. Costs ~1.8 MB in place of 4.5 MB; the
+    # reader may expand the lengths back to a flat array in memory, which is the
+    # point -- the wire is the scarce side, not the heap.
+    glen = np.diff(poff.astype(np.int64)).astype(np.uint64)
+    glen_buf, _ = varint_encode(glen)
+    coff = poff[goff]           # byte offset of each cell's FIRST group
 
     n_legs = con.execute("SELECT count(*) FROM leg").fetchone()[0]
     with open(path, "wb") as f:
         f.write(MAGIC)
-        f.write(struct.pack("<BBHII", IDX_VERSION, index_res, 0,
-                            len(ucell), n_legs))
+        # bucket_ds lives in the header, not just meta.json: a reader that has
+        # the index has everything it needs to map a time to a bucket.
+        f.write(struct.pack("<BBBBIIII", IDX_VERSION, index_res, n_buckets, 0,
+                            len(ucell), n_legs, len(gstarts), int(bucket_ds)))
         f.write(ucell.astype("<u8").tobytes())
-        f.write(off.astype("<u4").tobytes())
+        f.write(goff.astype("<u4").tobytes())
+        f.write(coff.astype("<u4").tobytes())
+        f.write(gbkt.astype("<u1").tobytes())
+        f.write(glen_buf.tobytes())
         f.write(post.tobytes())
-    log(f"cells.bin: {os.path.getsize(path)/1e6:.2f} MB, {len(ucell)} cells, "
-        f"{len(lid)} pairs, {len(post)/len(lid):.2f} B/pair")
-    return len(ucell), len(lid)
+    sz = os.path.getsize(path)
+    log(f"cells.bin: {sz/1e6:.2f} MB, {len(ucell)} cells, {len(gstarts)} groups "
+        f"({len(gstarts)/len(ucell):.2f}/cell), {len(lid)} pairs, "
+        f"{len(post)/len(lid):.2f} B/pair "
+        f"(post {len(post)/1e6:.2f} MB, cells {8*len(ucell)/1e6:.2f}, "
+        f"group tables {(8*len(ucell)+len(gbkt)+len(glen_buf))/1e6:.2f})")
+    return len(ucell), len(lid), len(gstarts), n_buckets
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +537,12 @@ def main():
                    help="data date YYYY-MM-DD; default: from the median base_ts")
     p.add_argument("--index-res", type=int, default=4,
                    help="H3 resolution of cells.bin (4 = ~45 km across)")
+    p.add_argument("--bucket-minutes", type=int, default=60,
+                   help="cells.bin time bucket WIDTH in minutes (60 = hourly). "
+                        "The bucket COUNT follows the data span, so a stitched "
+                        "multi-day input keeps its resolution instead of piling "
+                        "everything past hour 24 into the last bucket. 0 "
+                        "disables the time dimension (one bucket for the lot)")
     p.add_argument("--step-km", type=float, default=None,
                    help="curve sample spacing; default half the index cell edge")
     p.add_argument("--buckets", type=int, default=8,
@@ -470,8 +588,12 @@ def main():
     epoch = int(datetime.datetime(day.year, day.month, day.day,
                                   tzinfo=datetime.timezone.utc).timestamp())
     epoch_ds = epoch * 10
+    if a.bucket_minutes < 0:
+        sys.exit("--bucket-minutes must be >= 0")
+    # 0 = no time dimension: one bucket wide enough to hold any span
+    bucket_ds = a.bucket_minutes * 600 if a.bucket_minutes else 255 * DAY_DS
     log(f"date {day.isoformat()} (epoch {epoch}), index res {a.index_res}, "
-        f"step {step_km:.2f} km")
+        f"step {step_km:.2f} km, buckets {bucket_ds/600:.0f} min wide")
 
     has_cusp, n_legs, n_nodes = build_leg_table(
         con, a.points, a.meta, a.index_res, epoch_ds)
@@ -492,13 +614,20 @@ def main():
         f"({legs_bytes/max(n_legs,1):.1f} B/leg)")
 
     cells = os.path.join(a.out_dir, "cells.bin")
-    n_cells, n_pairs = write_cells(con, a.points, cells, a.index_res, step_km,
-                                   a.buckets, has_cusp, log)
+    n_cells, n_pairs, n_groups, n_buckets = write_cells(
+        con, a.points, cells, a.index_res, step_km, a.buckets, has_cusp,
+        bucket_ds, log)
 
     meta = dict(
         date=day.isoformat(), version=1,
         n_legs=n_legs, n_nodes=n_nodes,
         index_res=a.index_res, index_cells=n_cells, index_pairs=n_pairs,
+        index_groups=n_groups,
+        # bucket b of cells.bin covers [b*bucket_ds, (b+1)*bucket_ds)
+        # deciseconds from t_epoch. bucket_ds is the parameter; index_buckets is
+        # derived from the span, so it is 24 for a single UTC day and more for a
+        # stitched one. Both are also in the cells.bin header.
+        index_buckets=n_buckets, bucket_ds=int(bucket_ds),
         q_pos=int(Q_POS), t_unit="ds", t_epoch=epoch,
         t_epoch_iso=datetime.datetime.fromtimestamp(
             epoch, datetime.timezone.utc).isoformat().replace("+00:00", "Z"),

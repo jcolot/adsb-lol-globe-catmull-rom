@@ -102,9 +102,19 @@ CREATE OR REPLACE MACRO cr_axis(v0,v1,v2,v3, t1,t2,t3, u) AS (
 def densify_sql(points, has_cusp, step_km, max_sub, bucket, buckets, limit_legs):
     """Sample every leg's reconstructed CR curve at ~step_km spacing.
 
-    p0/p3 collapse onto p1/p2 at leg ends AND at cusp nodes, so the curve breaks
-    where the frontend breaks it. A cusp node legitimately appears as p0 of the
-    span after next (it is that segment's start), which the CASEs below allow."""
+    Emits leg_id, lat, lon, alt, t. p0/p3 collapse onto p1/p2 at leg ends AND at
+    cusp nodes, so the curve breaks where the frontend breaks it. A cusp node
+    legitimately appears as p0 of the span after next (it is that segment's
+    start), which the CASEs below allow.
+
+    `t` is the node time interpolated LINEARLY along the span, exactly as `alt`
+    is: the curve is centripetal in space, but nothing in the archive says how
+    time is distributed inside a span, so linear is the only defensible reading.
+    It stays in the source's units -- deciseconds past that AIRCRAFT's base_ts --
+    so a caller that needs one comparable timeline must rebase it per aircraft.
+    Rebasing is affine and constant within a leg, so interpolating then rebasing
+    equals rebasing then interpolating, and doing it after costs one join
+    instead of one per sample."""
     cusp = "cusp" if has_cusp else "false"
     # ORDER BY, or each bucket's LIMIT picks a different subset and the buckets
     # stop being a partition of one consistent set of legs.
@@ -118,15 +128,17 @@ WITH src AS (
     FROM '{points}'
     WHERE hash(leg_id) % {buckets} = {bucket} {legfilter}
 ), w AS (
-    SELECT leg_id, y, x, alt, cusp,
+    SELECT leg_id, y, x, alt, cusp, t,
            lag(y, 1)  OVER q AS y_1, lag(x, 1)  OVER q AS x_1,
            lead(y, 1) OVER q AS y1,  lead(x, 1) OVER q AS x1,
            lead(y, 2) OVER q AS y2,  lead(x, 2) OVER q AS x2,
-           lead(alt, 1) OVER q AS alt1, lead(cusp, 1) OVER q AS cusp1
+           lead(alt, 1) OVER q AS alt1, lead(cusp, 1) OVER q AS cusp1,
+           -- ts0/ts1, not t1/t2: t1..t3 are the CR KNOT parameters below
+           lead(t, 1) OVER q AS t_next
     FROM src WINDOW q AS (PARTITION BY leg_id ORDER BY t)
 ), span AS (
     -- one row per drawn span p1->p2, with its four control points resolved
-    SELECT leg_id, alt, alt1,
+    SELECT leg_id, alt, alt1, t AS ts0, t_next AS ts1,
            x AS x1c, y AS y1c, x1 AS x2c, y1 AS y2c,
            CASE WHEN cusp OR x_1 IS NULL THEN x  ELSE x_1 END AS x0c,
            CASE WHEN cusp OR y_1 IS NULL THEN y  ELSE y_1 END AS y0c,
@@ -149,10 +161,11 @@ WITH src AS (
 SELECT leg_id,
        cr_axis(y0c, y1c, y2c, y3c, t1, t2, t3, i::DOUBLE / nsub) AS lat,
        cr_axis(x0c, x1c, x2c, x3c, t1, t2, t3, i::DOUBLE / nsub) AS lon,
-       (alt + (alt1 - alt) * i::DOUBLE / nsub) AS alt
+       (alt + (alt1 - alt) * i::DOUBLE / nsub) AS alt,
+       (ts0 + (ts1 - ts0) * i::DOUBLE / nsub) AS t
 FROM knot, LATERAL range(nsub) g(i)
 UNION ALL
-SELECT leg_id, y AS lat, x AS lon, alt FROM w WHERE y1 IS NULL   -- each leg's last node
+SELECT leg_id, y AS lat, x AS lon, alt, t FROM w WHERE y1 IS NULL  -- last node
 """
 
 

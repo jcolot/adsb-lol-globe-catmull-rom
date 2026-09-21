@@ -18,9 +18,9 @@ stable ground altitude, and no parked-at-gate "scribbles".
 
 It also builds two derived layers over the same day: **H3 traffic-density vector
 tiles** (`traffic.pmtiles`) for the world-zoom overview, and a **day bundle** —
-about 8 MB of index shipped up front that makes every flight findable by
-callsign/registration/hex/route and answers "which flights went through this
-box?" with **zero further requests**, then one HTTP range read per track drawn.
+about 20 MB of index shipped up front that makes every flight findable by
+registration/hex/route and answers "which flights went through this box, in this
+hour?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages
 
@@ -609,27 +609,116 @@ date). This matters: `nodes.parquet` stores `t` relative to each *aircraft's*
 `aircraft.parquet` to rebase everything on one epoch — which is why it needs
 `--meta`.
 
-### `cells.bin` — H3 inverted index, shipped whole
+### `cells.bin` — H3 × time inverted index, shipped whole
 
 ```
-offset   size             field
-0        8                magic "ADSBIDX1"
-8        1                version    1
-9        1                res        H3 resolution (default 4)
-10       2                — padding —
-12       4                n_cells    uint32
-16       4                n_legs     uint32
-20       8 x n_cells      cell[]     uint64, ascending H3 index
-…        4 x (n_cells+1)  off[]      uint32 prefix offsets into post[]
-…        —                post[]     per cell: varint gap-coded ascending lids
+offset   size               field
+0        8                  magic "ADSBIDX1"
+8        1                  version    2
+9        1                  res        H3 resolution (default 4)
+10       1                  n_buckets  time buckets, DERIVED from the span
+11       1                  — padding —
+12       4                  n_cells    uint32
+16       4                  n_legs     uint32
+20       4                  n_groups   uint32, distinct (cell, bucket) pairs
+24       4                  bucket_ds  uint32, bucket WIDTH in deciseconds
+28       8 x n_cells        cell[]     uint64, ascending H3 index
+…        4 x (n_cells+1)    goff[]     uint32 prefix offsets into bucket[]/glen[]
+…        4 x (n_cells+1)    coff[]     uint32 byte offset in post[] of the
+                                       cell's FIRST group
+…        1 x n_groups       bucket[]   uint8, ascending within a cell
+…        —                  glen[]     n_groups varints: each group's byte
+                                       length in post[]
+…        —                  post[]     per group: varint gap-coded ascending lids
 ```
 
-Lookup is a binary search over `cell[]` and a slice of `post[off[i]..off[i+1]]`.
-Sorted by H3 index because a parent's descendants form exactly **one** contiguous
-run in that order, so "everything under this cell" is a single slice and the
-client can pick its covering resolution by zoom.
+A **group** is one `(cell, time bucket)`. Bucket *b* covers
+`[b * bucket_ds, (b+1) * bucket_ds)` deciseconds from `meta.t_epoch`. Lookup is
+a binary search over `cell[]` for the cell, then a scan of its `goff` run keeping
+the groups whose `bucket[]` falls in the window, prefix-summing `glen[]` from
+`coff[]` to find each one's slice of `post[]`.
 
-Gap-coded posting lists cost ~1.5 bytes per (cell, leg) pair.
+**The width is the parameter (`--bucket-minutes`, default 60); the count is
+derived from the data span.** Getting this backwards is a trap. "24 buckets per
+day" looks equivalent and breaks the moment the input spans more than one UTC
+day — which is what `splice_legs.py` produces, since a flight airborne at 00:00Z
+is cut in half by the archive boundary, and what a *local* day is for most of the
+world: Los Angeles runs 07:00Z to 07:00Z. With a per-day count every hour past
+the 24th clamps into the last bucket; measured on a two-day stitch, bucket 23
+held **30% of all groups** against ~750 for its neighbours — a bin holding 25
+hours of traffic, with no false negatives and no resolution either. Deriving the
+count gives that same stitch 48 real hourly buckets, with its last bucket at 810
+groups against an 861 average. `verify_bundle.py` checks both that the count
+covers the span and that the last bucket is not a dumping ground.
+
+`n_buckets` is a `uint8`, so hourly reaches 255 hours ≈ 10 days; past that the
+build fails and tells you to widen the bucket. A reader must take `bucket_ds`
+and `n_buckets` from the header and never derive them from 86,400.
+
+Cells stay sorted by H3 index because a parent's descendants form exactly **one**
+contiguous run in that order, so "everything under this cell" is a single slice
+and the client can pick its covering resolution by zoom.
+
+`glen[]` is varints rather than the flat `uint32` offset-per-group the first
+draft used, because at hourly granularity that table was 4.5 MB of a 17.7 MB
+index — more than a third of the file, to describe 10 MB of payload. A reader is
+free to expand it back into a flat array in memory; the wire is the scarce side.
+
+**Why the time dimension.** Without it a cell query can only be narrowed by each
+leg's `[t0, t1]`, and that span is the whole flight while its time inside one
+res-4 cell is minutes. Measured on 2026-09-20 for "who was in this cell during
+this window", against the exact per-visit answer:
+
+| cell, window | span prune alone | hourly index | exact |
+|---|---|---|---|
+| Brussels, 15 min | 388 (8.1×) | **89 (1.9×)** | 48 |
+| Heathrow, 15 min | 760 (7.2×) | **182 (1.7×)** | 106 |
+| enroute over the Alps, 15 min | 169 (**24.1×**) | **19 (2.7×)** | 7 |
+| Brussels, 1 h | 452 (4.2×) | **176 (1.6×)** | 108 |
+| Heathrow, 3 h | 887 (1.7×) | **593 (1.2×)** | 508 |
+
+Those multiples are `tracks.bin` range reads the client no longer makes — 4–9×
+fewer — and the worst case was an enroute cell, which is where the question is
+most interesting.
+
+**A sample claims the buckets out to its neighbours in time, not just its own.**
+This is the one subtle part of the build and it is not optional. The densifier
+samples the curve by **distance**, so a stationary aircraft is barely sampled in
+time at all: bucketing each sample on its own timestamp put a leg parked in the
+Brussels cell from 06:25 to 21:05 into buckets 6, 20 and 21 only — a fourteen
+hour hole in which every query missed it. The same defect at the other extreme
+is one sample interval wide: a leg whose last in-cell sample sat at 11:59:28 was
+absent from the 12:00 bucket though it was still in the cell at 12:00:42.
+Claiming out to each neighbour fixes both with one rule and no threshold, since
+between consecutive samples the curve moves at most `step_km` and cannot leave a
+~45 km cell and return. Where the neighbour lies outside the cell the claim
+over-reaches by at most one sample interval — a false positive, never a false
+negative. It costs 4.6% more pairs and 0.41 MB.
+
+`verify_bundle.py` asserts the invariant directly: two consecutive nodes in the
+same cell bracket an interval the aircraft provably spent there, so every bucket
+between them must be posted.
+
+**Size.** Hourly is not free, and the honest numbers are:
+
+| `--bucket-minutes` | cells.bin | of which postings | B/pair | shipped whole |
+|---|---|---|---|---|
+| 0 (no time dimension) | 9.23 MB | 6.36 MB | 1.41 | 13.8 MB |
+| 360 (6 h) | 11.05 MB | 7.69 MB | 1.62 | 15.6 MB |
+| 180 (3 h) | 12.34 MB | 8.58 MB | 1.75 | 16.9 MB |
+| **60 (1 h, default)** | **15.34 MB** | 10.51 MB | 1.98 | **19.9 MB** |
+| 30 | 18.24 MB | 12.36 MB | 2.12 | 22.8 MB |
+
+Hourly costs **+6.1 MB** over no time dimension, and a pair count alone does not
+predict that. Pairs grow only 1.18×; what actually costs is that splitting a
+cell's postings by hour leaves each list sparser over the same `lid` range, so
+gap coding degrades from 1.41 to 1.98 bytes per pair, plus 1.95 MB of group
+tables. If 19.9 MB resident is too much, `--bucket-minutes 180` keeps most of the
+precision win for 3.0 MB less (`IDX_BUCKET_MIN` in `run_pipeline.sh`).
+
+Note that `--bucket-minutes 0` is **not** byte-identical to a v1 index (9.23 vs
+8.26 MB): it carries the v2 group tables for a single group per cell. Use it to
+turn the time dimension off, not to reproduce the old file.
 
 ### `tracks.bin` — per-leg records, range-read
 

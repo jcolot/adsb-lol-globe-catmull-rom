@@ -35,6 +35,9 @@ HEX_RASTER_GAMMA="${HEX_RASTER_GAMMA:-2}"   # 1 = linear ramp; 2 = sqrt, see hex
 HEX_GRID_ZOOM="${HEX_GRID_ZOOM:-2}"    # raw density grid for render_video.py; 2 = 2048px
 HEX_VECTOR="${HEX_VECTOR:-}"           # non-empty also builds traffic.pmtiles
 IDX_RES="${IDX_RES:-4}"                # H3 resolution of cells.bin (~45 km cells)
+IDX_BUCKET_MIN="${IDX_BUCKET_MIN:-60}" # cells.bin time bucket WIDTH in minutes
+                                       # (60 = hourly; 180 trades precision for
+                                       # ~3 MB less). Count follows the span.
 BUNDLE_BUCKETS="${BUNDLE_BUCKETS:-8}"
 BUNDLE_MEMORY="${BUNDLE_MEMORY:-}"
 VERIFY_LEGS="${VERIFY_LEGS:-2000}"     # legs round-trip decoded by the gate
@@ -142,6 +145,7 @@ bundle() {
         --meta "$WORK/nodes/aircraft.parquet" \
         --out-dir "$OUT/legs" \
         --index-res "$IDX_RES" --buckets "$BUNDLE_BUCKETS" \
+        --bucket-minutes "$IDX_BUCKET_MIN" \
         ${BUNDLE_MEMORY:+--memory-limit "$BUNDLE_MEMORY"}
     python3 "$SCRIPT_DIR/verify_bundle.py" \
         --bundle "$OUT/legs" \
