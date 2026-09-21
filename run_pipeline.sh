@@ -42,6 +42,17 @@ VERIFY_BOXES="${VERIFY_BOXES:-25}"
 OVN_MAX_GAP_H="${OVN_MAX_GAP_H:-3}"    # splice_legs.py boundary gap tolerance
 TAGFILE="$WORK/TAG"
 
+# The data date lives in the release tag: v2026.07.17-...-prod-0 -> 2026-07-17.
+# Three phases need it (leg_id carries it, the overnight artifacts are keyed on
+# it, upload picks the partition with it), so it is parsed in one place.
+data_date() {
+    local tag; tag="$(cat "$TAGFILE" 2>/dev/null || echo '?')"
+    local d; d="$(printf '%s' "$tag" \
+        | sed -nE 's/^v([0-9]{4})\.([0-9]{2})\.([0-9]{2}).*/\1-\2-\3/p')"
+    [ -n "$d" ] || { echo "could not parse date from tag: $tag" >&2; return 1; }
+    printf '%s' "$d"
+}
+
 resolve() {
     mkdir -p "$WORK"
     local tag
@@ -88,10 +99,15 @@ fit() {
         --tol-ground "$TOL_GROUND" --tol-cruise "$TOL_CRUISE" --corner "$CORNER"
 }
 
+# --date is what every leg_id is prefixed with, so it is passed explicitly from
+# the release tag rather than inferred: build_legs can derive it from base_ts,
+# but the tag is the authority on which archive this is, and an id built from a
+# guess would collide with a real day's.
 legs() {
+    local date; date="$(data_date)"
     mkdir -p "$OUT"; rm -rf "$OUT/legs"
     python3 "$SCRIPT_DIR/build_legs.py" \
-        --traces "$WORK/nodes/nodes.parquet" \
+        --traces "$WORK/nodes/nodes.parquet" --date "$date" \
         --meta "$WORK/nodes/aircraft.parquet" --out-dir "$OUT/legs"
 }
 
@@ -143,9 +159,7 @@ bundle() {
 # for D-1, not D, and it is copied into the PREVIOUS partition. Everything else
 # (the UTC-offset table, the meta) is for D and needs no history.
 overnight() {
-    local tag; tag="$(cat "$TAGFILE" 2>/dev/null || echo '?')"
-    local date; date="$(printf '%s' "$tag" | sed -nE 's/^v([0-9]{4})\.([0-9]{2})\.([0-9]{2}).*/\1-\2-\3/p')"
-    [ -n "$date" ] || { echo "could not parse date from tag: $tag"; exit 1; }
+    local date; date="$(data_date)"
     local prev; prev="$(date -u -d "$date -1 day" +%F 2>/dev/null \
                         || date -u -j -v-1d -f %F "$date" +%F)"
 
@@ -175,9 +189,16 @@ overnight() {
         echo "no leg index for $prev in R2 -- skipping the settled table for it"
     fi
 
+    # --tz-back the whole retention window: the per-date copy of this table
+    # only ever resolved D, D-1, D-2, so a client asking about a local date
+    # further back had no way to turn its midnight into UTC. Widening it costs
+    # ~2.5 KB a day (measured: 89 KB for 4 dates, 160 KB for 32) and upload()
+    # copies the newest one to the bucket ROOT, where it is not pruned and one
+    # fetch answers every date the archive still holds.
     python3 "$SCRIPT_DIR/overnight.py" \
         --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
-        --emit-client "$OUT/legs" --date "$date" "${table_args[@]}"
+        --emit-client "$OUT/legs" --date "$date" \
+        --tz-back "${RETENTION_DAYS:-30}" "${table_args[@]}"
 
     # the settled table belongs to the PREVIOUS partition, which this run's sync
     # does not touch -- copy, never sync, or the prior day's files are deleted.
@@ -206,23 +227,48 @@ overnight() {
             fi
         fi
     fi
+    # The spliced leg table itself, not just the offsets derived from it. A
+    # flight airborne at 00:00Z reaches a client as two half-legs with a NULL
+    # endpoint each, and nothing it can fetch says they are one flight -- the
+    # repair was computed here and then thrown away. leg_id is "<tail>+<head>",
+    # so a client can map a half back to the whole. Same partition and same
+    # copyto-not-sync rule as the settled table: it is $prev's file -- and
+    # NON-FATAL for the same reason, since it is the same write to the same
+    # prefix that has been returning 403.
+    if [ -s "$WORK/overnight/spliced.parquet" ] && [ -n "${R2_BUCKET:-}" ]; then
+        if rclone copyto "$WORK/overnight/spliced.parquet" \
+               "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/spliced.parquet" --checksum; then
+            echo "spliced leg table -> date=$prev/spliced.parquet"
+        else
+            echo "WARNING: could not write date=$prev/spliced.parquet" >&2
+            echo "  date=$prev keeps its leg index; clients fall back to the" >&2
+            echo "  unrepaired half-legs across that midnight." >&2
+            if [ -n "${GITHUB_ACTIONS:-}" ]; then
+                echo "::warning title=Spliced legs upload failed::spliced.parquet was not written to date=$prev - the midnight-cut legs stay unrepaired for that day, but the pipeline is otherwise complete"
+            fi
+        fi
+    fi
 }
 
 upload() {
     : "${R2_BUCKET:?set R2_BUCKET (Cloudflare R2 bucket name)}"
     local keep="${RETENTION_DAYS:-30}"
     local base="r2:$R2_BUCKET/$R2_PREFIX"
-    local tag; tag="$(cat "$TAGFILE" 2>/dev/null || echo '?')"
-    # data date lives in the release tag: v2026.07.17-...-prod-0 -> 2026-07-17
-    local date; date="$(printf '%s' "$tag" | sed -nE 's/^v([0-9]{4})\.([0-9]{2})\.([0-9]{2}).*/\1-\2-\3/p')"
-    [ -n "$date" ] || { echo "could not parse date from tag: $tag"; exit 1; }
+    local date; date="$(data_date)"
 
     # each day is its own self-contained prefix; sync only touches THIS date, so
     # other days are never deleted. points_legs.parquet is a build intermediate
     # that tracks.bin now supersedes -- keeping both roughly doubles the per-day
     # storage, so it stays local.
+    #
+    # overnight.parquet and spliced.parquet are excluded because they are never
+    # in $OUT/legs: they are D-1's files, written into this partition by the
+    # FOLLOWING day's run. Without the exclude, re-running or backfilling a day
+    # would sync them away as extras and they would not come back until that
+    # day's successor ran again.
     rclone sync "$OUT/legs" "$base/date=$date" \
         --exclude 'points_legs.parquet' --exclude 'traffic-grid.npz' \
+        --exclude 'overnight.parquet' --exclude 'spliced.parquet' \
         --checksum --transfers 16 --fast-list --stats-one-line
 
     # prune to the newest $keep date partitions
@@ -237,9 +283,64 @@ upload() {
     # rebuild the date manifest (a browser can't list a bucket over HTTP)
     mapfile -t kept < <(rclone lsf --dirs-only "$base/" | sed 's#/$##' \
         | grep '^date=' | sed 's/^date=//' | sort)
-    python3 -c "import json,sys; d=sys.argv[1:]; print(json.dumps({'dates':d,'latest':d[-1] if d else None}))" \
-        "${kept[@]}" > "$WORK/dates.json"
+
+    # `days` carries each partition's flights_schema, because the retained
+    # window is NOT schema-homogeneous: days built before t_off/t_on/base_ts
+    # existed are still in it and cannot be put on an absolute clock at all, so
+    # a client that assumes otherwise silently drops them or dates them wrong.
+    # This run knows its OWN schema from legs_meta.json; every other date is
+    # carried forward from the manifest already in the bucket, so the map fills
+    # in as days roll over and a missing entry honestly means "built before
+    # this, feature-detect the columns".
+    rclone cat "$base/dates.json" > "$WORK/dates_prev.json" 2>/dev/null || true
+    python3 - "$date" "$OUT/legs/legs_meta.json" "$WORK/dates_prev.json" \
+        "${kept[@]}" > "$WORK/dates.json" <<'PY'
+import json, sys
+date, meta_path, prev_path, *kept = sys.argv[1:]
+days = {}
+try:
+    days = json.load(open(prev_path)).get("days") or {}
+except Exception:
+    pass
+try:
+    m = json.load(open(meta_path))
+    days[date] = {k: m[k] for k in
+                  ("flights_schema", "base_ts_uniform", "t_epoch", "n_legs")
+                  if k in m}
+except Exception:
+    print(f"no legs_meta.json for {date}", file=sys.stderr)
+days = {d: days[d] for d in kept if d in days}          # drop pruned dates
+print(json.dumps({"dates": kept, "latest": kept[-1] if kept else None,
+                  "days": days}))
+PY
     rclone copyto "$WORK/dates.json" "$base/dates.json"
+
+    # The UTC-offset table, at the ROOT rather than inside a partition. The
+    # per-date copies resolve only their own D, D-1, D-2, so no single one of
+    # them can turn "local midnight on any retained date" into UTC -- and the
+    # oldest partitions predate the artifact entirely. This copy spans the whole
+    # retention window (see --tz-back) and lives outside date=, where the prune
+    # never reaches: one stable URL, one fetch, every date.
+    #
+    # Non-fatal, like every other write outside date=$date: these two land at
+    # the root, the day partition is already up, and losing the root copy costs
+    # local-time queries on older dates -- not this day's data. The per-date
+    # copy of the table shipped with the sync either way.
+    if [ -s "$OUT/legs/airports_utc.parquet" ]; then
+        if rclone copyto "$OUT/legs/airports_utc.parquet" \
+               "$base/airports_utc.parquet" --checksum \
+           && rclone copyto "$OUT/legs/overnight_meta.json" \
+               "$base/overnight_meta.json" --checksum; then
+            echo "root UTC-offset table -> $base/airports_utc.parquet"
+        else
+            echo "WARNING: could not write the root airports_utc.parquet" >&2
+            echo "  clients fall back to the per-date copies, which resolve" >&2
+            echo "  only their own D+1..D-2." >&2
+            if [ -n "${GITHUB_ACTIONS:-}" ]; then
+                echo "::warning title=Root offset table upload failed::airports_utc.parquet was not written to the bucket root - local-time queries on older dates will not resolve, but the day partition is complete"
+            fi
+        fi
+    fi
     # The raw density grid goes to its own prefix, NOT into date=$date, because
     # the prune only ever walks date= partitions -- so the grids survive
     # retention. That is the point of them: they are the only per-day artifact

@@ -51,10 +51,17 @@ diagnostic modules (`validate_recon.py` measures reconstruction error vs raw).
 | `alt` | int32 | feet |
 | `on_ground` | bool | |
 | `cusp` | bool | **break the spline here** (taxi corner / ground↔air) |
-| `leg_id`, `dep`, `arr`, `reg`, `type` | | leg / aircraft metadata |
+| `leg_id` | string | `{date}_{icao}_{k}` — unique across partitions, not just within one (schema 4+; older days are `{icao}_{k}`) |
+| `dep`, `arr`, `reg`, `type` | | leg / aircraft metadata |
+| `base_ts` | int64 | **absolute UTC seconds = `base_ts + t/10`.** `t` alone is relative and not comparable between aircraft |
+| `t_off`, `t_on` | int64 | that leg's wheels-off / wheels-on, same units as `t`. Filter time on these, not on the first and last node — the node span includes taxi and ramp |
+| `dep_gnd`, `arr_gnd` | bool | false means that end never emitted a surface message, so the airport and the wheels time there are approximations |
 
 **Frontend:** draw a centripetal Catmull-Rom through consecutive nodes, starting a
-new curve at every `cusp` node.
+new curve at every `cusp` node. The last five columns are constant within a leg
+and cost 1.41% of the file; they are there so this one file answers "which
+flights were here between two instants" without also fetching the day index —
+see *Frontend: all flights at one airport, for a local day*.
 
 ## Run locally
 
@@ -580,9 +587,13 @@ would otherwise force two copies of the geometry.
 
 ### `legs.parquet` — one row per leg, shipped whole
 
-`lid`, `icao`, `reg`, `type`, `dep`, `arr`, `t0`, `t1`, `n_nodes`, the bounding
-box (`min_lat`…`max_lon`, degrees × 1e5), `min_alt`/`max_alt` in feet, and
-`off`/`len` — the byte range of that leg's record in `tracks.bin`.
+`lid`, `icao`, `leg_id`, `reg`, `type`, `dep`, `arr`, `t0`, `t1`, `n_nodes`, the
+bounding box (`min_lat`…`max_lon`, degrees × 1e5), `min_alt`/`max_alt` in feet,
+and `off`/`len` — the byte range of that leg's record in `tracks.bin`.
+
+`lid` is this file's row index and means nothing outside it; `leg_id` is the
+stable identity that joins to `flights.parquet`, the per-airport partitions and
+`spliced.parquet`, and from schema 4 on it carries its own date.
 
 **`lid` is the row index**, so a posting list from `cells.bin` indexes this table
 directly with no lookup map.
@@ -670,6 +681,92 @@ data). There are never false negatives — that is the property `verify_bundle.p
 asserts. Refine against the leg bbox, then against real geometry, for boxes
 tighter than a cell.
 
+### Frontend: all flights at one airport, for a local day
+
+A local day is a UTC window, and that window is **not** a `date=` partition. Get
+that wrong and the error is not a rounding one: it is the wrong flights.
+
+```js
+// 1. local midnight -> UTC, from the ROOT airports_utc.parquet (spans the
+//    retained window; the per-date copies only speak for their own few days)
+const off  = offMin(apt[icao], meta, Date.UTC(y, m - 1, d));          // minutes
+const off1 = offMin(apt[icao], meta, Date.UTC(y, m - 1, d + 1));      // DST days
+const w0 = Date.UTC(y, m - 1, d)     / 1000 - off  * 60;
+const w1 = Date.UTC(y, m - 1, d + 1) / 1000 - off1 * 60;   // 23, 24 or 25 h
+
+// 2. the UTC dates that window touches -- one or two, never three
+const partitions = [...new Set([w0, w1 - 1].map(
+  s => new Date(s * 1000).toISOString().slice(0, 10)))];
+
+// 3. one request per partition -- the per-airport file carries the leg's
+//    base_ts / t_off / t_on / ground flags alongside every point, so nothing
+//    else has to be fetched to know which flights these are
+const legs = new Map();                        // `${date}/${leg_id}` -> points
+for (const date of partitions) {
+  if (!manifest.dates.includes(date)) markIncomplete(date);   // see below
+  for (const r of await parquet(
+        `legs/date=${date}/airports/airport=${icao}/data_0.parquet`)) {
+    const t = r.dep === icao ? r.t_off : r.t_on;              // wheels, not ramp
+    const utc = r.base_ts + t / 10;
+    if (utc < w0 || utc >= w1) continue;
+    push(legs, `${date}/${r.leg_id}`, r);      // key by DATE + leg_id, see below
+  }
+}
+```
+
+An eastern airport reaches **backwards** (EBBR at +02:00 opens its day at 22:00Z
+the previous date), a western one reaches **forwards** (KLAX at −07:00 closes at
+07:00Z the next), which is why the second partition is sometimes one that does
+not exist yet.
+
+**Filter on `t_off`/`t_on`, never `t_start`/`t_end`.** The envelope carries taxi
+and ramp time: measured on 2026-09-09 over legs with a ground fix at both ends,
+`t_off - t_start` is 8.0 min at p50 and 21.5 at p90, and `t_end - t_on` is 4.5
+and 12.4. A flight that pushes back at 23:55 local and lifts off at 00:06 is
+tomorrow's departure, and the envelope puts it in today.
+
+Measured for EBBR, local day 2026-09-09 (`+02:00`, so 2026-09-08 22:00Z →
+2026-09-09 22:00Z), against both partitions:
+
+| | departures | arrivals |
+|---|---|---|
+| from `date=2026-09-09` | 305 | 290 |
+| from `date=2026-09-08` | **6** | **15** |
+| local day, total | 311 | 305 |
+| reading `date=2026-09-09` alone | 311 | 313 |
+
+The departure counts matching is a coincidence — the *sets* differ by 6 at each
+end of the day. That is the error a naive one-partition read makes: not a small
+count, but the wrong flights, and always the same ones (the late-evening bank,
+which is exactly what an airport-day view is usually asked about).
+
+Three things the query has to handle, none of them optional:
+
+- **`leg_id` is globally unique — but only from `flights_schema` 4 on.** It is
+  `{date}_{icao}_{k}`, so the id alone is a key across partitions. It used to be
+  `{icao}_{k}` with `k` restarting every day: 78,148 ids were shared between
+  2026-09-08 and 2026-09-09, meaning different flights in each, and a client
+  spanning a local midnight silently merged them. Partitions already in the
+  bucket still carry the old form, so check `dates.json`'s `days[date]
+  .flights_schema` and key by `(date, leg_id)` for anything below 4.
+- **The neighbouring partition is often missing.** The manifest has real holes
+  (six of the 36 days before 2026-09-18), the newest day's successor does not
+  exist until the next run, and retention eventually eats the predecessor. Check
+  `manifest.dates` for *both* partitions and show a partial day as partial —
+  a western airport's local day is never complete on the day itself.
+- **The retained window is not schema-homogeneous.** Partitions built before
+  `t_off`/`t_on`/`base_ts` existed cannot be put on an absolute clock at all.
+  `dates.json`'s `days` map carries each date's `flights_schema` (see
+  `legs_meta.json`), and a date absent from it predates the map — feature-detect
+  its columns, or leave it out of a local-time picker rather than dating it
+  wrong.
+
+Cost, for EBBR: the root offset table (160 KB, cached across every query) plus
+one 0.73 MB request per partition. The day-wide `flights.parquet` is **not** on
+this path — carrying `base_ts`/`t_off`/`t_on`/`dep_gnd`/`arr_gnd` into the
+per-airport file costs 1.41% of it and saves fetching 3.6 MB to read five
+values per leg.
+
 ### What this replaces, and what it doesn't
 
 `points_legs.parquet` is no longer uploaded — nothing reads it, and `tracks.bin`
@@ -677,7 +774,9 @@ supersedes it at a third less size (measured on 2026-09-01: 161 MB vs ~106 MB fo
 the same 14.4 M nodes).
 
 `legs/airports/airport=<ICAO>/data_0.parquet` is **still built and uploaded, and
-should stay that way.** An earlier draft of this section claimed the bundle made
+should stay that way** — and it now carries each leg's `base_ts`, `t_off`,
+`t_on`, `dep_gnd` and `arr_gnd` alongside the points, so one request answers
+both "which flights" and "draw them" without the day-wide index. An earlier draft of this section claimed the bundle made
 it redundant; measuring the read pattern showed that's only half true, and the
 half it gets wrong is the expensive half.
 
@@ -892,6 +991,32 @@ retained day has no predecessor, leaving its early-morning arrivals unresolved.
 ./overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
 ```
 
+### Reading the splice
+
+`spliced.parquet` in `date=D` is that day's legs with the midnight cut repaired:
+one row per leg *departing* in D's UTC day, `dep`/`arr` both non-NULL, `t_off`
+and `t_on` in **absolute** deciseconds with `base_ts = 0` (so the usual
+`base_ts + t/10` still yields UTC), and a `spliced` flag.
+
+It is published because the repair was previously computed and thrown away. A
+client reading the partitions sees a flight airborne at 00:00Z as two half-legs
+with a NULL endpoint each — 46 of them touch EBBR's local day 2026-09-09 alone —
+and nothing it could fetch said they were one flight. A spliced row's `leg_id` is
+`<tail>+<head>`, and each half now carries its own date, so splitting on `+`
+maps straight back to the partition holding that half's geometry:
+
+```js
+const [tail, head] = row.leg_id.split('+');
+// "2026-09-08_4ca123_7" and "2026-09-09_4ca123_0" -- the date is in the id
+```
+
+Two consequences of how it is built. It lands **a day late** — D's tails cannot
+be matched until D+1 exists — so `date=D/spliced.parquet` appears during D+1's
+run, the same lag `overnight.parquet` has and for the same reason. And unmatched
+halves are **dropped, not carried**: a half's `t_on` is the truncation instant,
+not a wheels event, and the table exists to be trusted. If you need the halves
+themselves, they are still in `flights.parquet`, NULL endpoint and all.
+
 ### Validated against BTS
 
 US DOT's [Reporting Carrier On-Time Performance](https://www.bts.gov/topics/airlines-and-airports/number-14-time-reporting)
@@ -973,9 +1098,26 @@ ships as **data**, in three files per day.
 
 | file | partition | what |
 |---|---|---|
-| `airports_utc.parquet` | `date=D` | 6,372 airports: `ident`, `lat`/`lon` (degrees x 1e5), `tz`, and `off_d0`/`off_dm1`/`off_dm2` — UTC offset in **minutes** for D, D-1, D-2 |
+| `airports_utc.parquet` | **bucket root** | the same table spanning the whole retained window — one URL, one fetch, every date |
+| `airports_utc.parquet` | `date=D` | 6,372 airports: `ident`, `lat`/`lon` (degrees x 1e5), `tz`, and `off_dp1`/`off_d0`/`off_dm1`/`off_dm2` — UTC offset in **minutes** for D+1, D, D-1, D-2 |
 | `overnight.parquet` | `date=D-1` | the settled tier-1 lookup, `(dep, arr, arr_local_hour) -> day_offset` |
-| `overnight_meta.json` | `date=D` | tier-2 model coefficients, and whether a settled table exists |
+| `spliced.parquet` | `date=D-1` | the repaired legs the table was fitted on — see *Reading the splice* |
+| `overnight_meta.json` | `date=D`, and the root | tier-2 model coefficients, `tz_columns`/`tz_dates`, and whether a settled table exists |
+
+**Two copies of the offset table, deliberately.** The per-date one is part of a
+self-contained partition and resolves only its own D+1…D-2. The root one is
+built with `--tz-back $RETENTION_DAYS`, lives outside `date=` where the prune
+never reaches, and is rewritten every run — so a client asking about a local day
+three weeks back has somewhere to get that day's offset. Without it the question
+was unanswerable: the oldest partitions predate the artifact entirely, and the
+ones that have it only speak for their own three days. Widening it is cheap —
+measured 89 KB over 4 dates, 160 KB over 32, i.e. ~2.5 KB a date against a
+fixed ~80 KB of idents and zone names.
+
+**`off_dp1` exists for the closing midnight.** A local day ends at midnight of
+*L+1*, resolved with *L+1*'s offset, and on a DST-transition date that is not
+`off_d0` — the local day is 23 or 25 hours long. Without the column the newest
+partition could not close its own local day.
 
 **Parquet, not a custom binary.** Measured: 86 KB against 137 KB raw for an
 equivalent `.bin`. The binary is ~18 KB smaller *gzipped* (63 vs 81 KB), which
@@ -991,11 +1133,14 @@ From a zone name that needs `Temporal` or an iterate-and-correct loop, including
 the ambiguous DST hour. An integer offset makes both directions addition and
 bakes DST in for the date.
 
-⚠️ **Fetch the partition for the arrival date you are asking about.** The file
-covers only D, D-1 and D-2, which is exactly enough: arrival on D, and a
-departure up to two days earlier for a westbound date-line crossing. Reading a
-D-2 arrival out of *today's* file needs D-3 and the decoder throws — that guard
-is deliberate, and widening the window would hide the misuse without closing it.
+⚠️ **Check which dates a copy of the table covers, and throw outside them.**
+`overnight_meta.json` carries `tz_columns` and the `tz_dates` they resolve, in
+the same order, so a client maps a date to a column by lookup instead of
+reproducing the `d0`/`dm1` arithmetic. A per-date copy covers D+1…D-2, which is
+exactly enough for the overnight question: arrival on D, and a departure up to
+two days earlier for a westbound date-line crossing. Reading a D-2 arrival out
+of *today's* file needs D-3 and the decoder throws — that guard is deliberate.
+Use the root copy when you need a date outside the partition's own window.
 
 Two passes are needed on the departure side: its local date is not known until
 it is computed, and its offset depends on that date. One correction is enough,
@@ -1004,25 +1149,29 @@ since a DST step is at most an hour.
 ```js
 const DAY = 1440;
 
-function offMin(rec, d0Ms, dateMs) {
-  const k = Math.round((d0Ms - dateMs) / 86400000);
-  if (k < 0 || k > 2) throw new Error(`date outside the 3-day window (k=${k})`);
-  return [rec.off_d0, rec.off_dm1, rec.off_dm2][k];
+// meta.tz_dates[i] is the date meta.tz_columns[i] resolves; both come from
+// overnight_meta.json and are ordered newest-first (off_dp1, off_d0, off_dm1…)
+function offMin(rec, meta, dateMs) {
+  const iso = new Date(dateMs).toISOString().slice(0, 10);
+  const i = meta.tz_dates.indexOf(iso);
+  if (i < 0) throw new Error(
+    `${iso} outside this table: ${meta.tz_dates.at(-1)}..${meta.tz_dates[0]}`);
+  return rec[meta.tz_columns[i]];
 }
 
 // arrLocal: {y, m, d, hh, mm} wall clock at the ARRIVAL airport.
-export function classify(dep, arr, arrLocal, apt, d0Ms, blockMin) {
+export function classify(dep, arr, arrLocal, apt, meta, blockMin) {
   const { y, m, d, hh, mm } = arrLocal;
   const arrDateMs  = Date.UTC(y, m - 1, d);
   const arrLocalMin = Date.UTC(y, m - 1, d, hh, mm) / 60000;
-  const arrUtcMin = arrLocalMin - offMin(apt[arr], d0Ms, arrDateMs);
+  const arrUtcMin = arrLocalMin - offMin(apt[arr], meta, arrDateMs);
   const depUtcMin = arrUtcMin - blockMin;
 
-  let off = offMin(apt[dep], d0Ms, arrDateMs);
+  let off = offMin(apt[dep], meta, arrDateMs);
   let depLocalMin = depUtcMin + off;
   const depDateMs = Math.floor(depLocalMin / DAY) * DAY * 60000;
   if (depDateMs !== arrDateMs) {
-    const off2 = offMin(apt[dep], d0Ms, depDateMs);
+    const off2 = offMin(apt[dep], meta, depDateMs);
     if (off2 !== off) depLocalMin = depUtcMin + off2;
   }
 
@@ -1137,10 +1286,18 @@ https://pub-135f2252a0074f0b9761b0dc93a75fa5.r2.dev/legs
 The date is the *data* date, taken from the release tag.
 
 1. **Discover available days** — fetch the manifest (a browser can't list a bucket):
+   ```jsonc
+   .../legs/dates.json
+   {"dates": ["2026-07-18", "2026-07-19"], "latest": "2026-07-19",
+    "days": {"2026-07-19": {"flights_schema": 3, "base_ts_uniform": true,
+                            "t_epoch": 1784419200, "n_legs": 128697}}}
    ```
-   .../legs/dates.json   ->   {"dates": ["2026-07-18", "2026-07-19"], "latest": "2026-07-19"}
-   ```
-   Default the day picker to `latest`.
+   Default the day picker to `latest`. **`dates` has holes** — an upstream
+   release can be missing and retention prunes from the far end, so never assume
+   `D-1` exists because `D` does. `days[date]` carries that partition's
+   `flights_schema` (mirroring its `legs_meta.json`); a date missing from `days`
+   was built before the map existed, which means schema 1 or 2 — feature-detect
+   before trusting `t_off`/`base_ts`.
 2. **A partition** for a chosen `<DATE>`:
    `https://pub-135f2252a0074f0b9761b0dc93a75fa5.r2.dev/legs/date=<DATE>/airports/airport=<ICAO>/data_0.parquet`
 3. **The leg index** for that day: `.../legs/date=<DATE>/flights.parquet`
@@ -1149,10 +1306,18 @@ The date is the *data* date, taken from the release tag.
 5. **The day bundle** for that day: `.../legs/date=<DATE>/` →
    `meta.json`, `legs.parquet`, `cells.bin`, `tracks.bin`
 6. **The overnight artifacts**: `.../legs/date=<DATE>/` →
-   `airports_utc.parquet`, `overnight_meta.json`, and `overnight.parquet` —
-   the last one lands a day later than the other two, since it is settled
-   during the *following* night's run (see *Static artifacts for external
-   clients*)
+   `airports_utc.parquet`, `overnight_meta.json`, `overnight.parquet` and
+   `spliced.parquet` — the last two land a day later than the others, since
+   they are settled during the *following* night's run (see *Static artifacts
+   for external clients*)
+7. **The UTC-offset table for any retained date**: `.../legs/airports_utc.parquet`
+   and `.../legs/overnight_meta.json` — at the **root**, not in a partition,
+   spanning the whole retention window and never pruned. This is the one to
+   fetch for local-time queries; the per-date copies resolve only their own
+   D+1…D-2.
+8. **What a partition is**: `.../legs/date=<DATE>/legs_meta.json` →
+   `flights_schema`, `base_ts_uniform`, `t_epoch`, `n_legs`. Absent on days
+   built before it existed.
 
 **Exactly one file per airport.** The per-airport write is single-threaded so each
 partition is a single `data_0.parquet` (DuckDB's parallel partitioned write would

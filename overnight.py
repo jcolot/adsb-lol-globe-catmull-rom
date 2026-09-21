@@ -279,12 +279,14 @@ def build_table(legs, airports, out):
           f"(arr_local_hour = -1)")
 
 
-def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
+def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0,
+                tz_back=2):
     """Write the static artifacts a browser needs, into out_dir.
 
     airports_utc.parquet -- one row per airport: ident, lat/lon (degrees * 1e5,
     the repo's Q_POS convention), the IANA zone name, and the UTC offset in
-    MINUTES already resolved for this partition's date and the two before it.
+    MINUTES already resolved for a window of dates around this partition's:
+    off_dp1 for D+1, off_d0 for D, off_dm1..off_dm<tz_back> for the days before.
 
     Resolved offsets rather than zone names because the conversion a client
     needs is local-wall-clock -> UTC, which is the direction Intl.DateTimeFormat
@@ -294,9 +296,17 @@ def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
     zone name is carried anyway because it dictionary-compresses to nearly
     nothing and a client that wants to do it properly should be able to.
 
-    Three dates because a departure can be up to two days before the arrival
-    date (a westbound date-line crossing is +2). Only 7 dates in 2026 have a
-    shift at any of these airports, so it rarely matters -- and costs ~4 KB.
+    D-2 because a departure can be up to two days before the arrival date (a
+    westbound date-line crossing is +2). D+1 because a LOCAL day at a negative
+    offset runs past 00:00Z into the next UTC date, and its closing midnight is
+    resolved with D+1's offset, not D's -- without that column the newest
+    partition cannot close its own local day. Only 7 dates in 2026 have a shift
+    at any of these airports, so it rarely matters -- and costs ~1 KB a column.
+
+    --tz-back widens the window to the whole retained archive, so ONE copy of
+    this table (the root-level one, see run_pipeline.sh) answers any local date
+    a client can still fetch data for. The per-date copies stay as they are:
+    each partition remains self-contained.
 
     Parquet, not a custom binary: measured at 86 KB against 137 KB raw for an
     equivalent .bin. The .bin is ~18 KB smaller gzipped, which is not worth a
@@ -308,24 +318,31 @@ def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
     import json
     import pyarrow as pa, pyarrow.parquet as pq
     d0 = dt.date.fromisoformat(date)
+    tz_back = max(2, int(tz_back))
+    # k runs -1 (D+1), 0 (D), 1..tz_back (D-1 ..) -- the same order as the
+    # column list below, so a client's k -> column mapping is positional
+    ks = [-1] + list(range(0, tz_back + 1))
+    names = ["off_dp1"] + ["off_d0"] + [f"off_dm{k}" for k in range(1, tz_back + 1)]
     rows = []
     for ident, (lat, lon, tz) in airports.items():
         o = []
-        for k in (0, 1, 2):
+        for k in ks:
             d = d0 - dt.timedelta(days=k)
+            # noon, so the offset is the one in force for the bulk of the local
+            # day rather than whichever side of a 02:00 DST step midnight fell
             o.append(int(dt.datetime(d.year, d.month, d.day, 12,
                                      tzinfo=tz).utcoffset().total_seconds() // 60))
         rows.append((ident, int(lat * 1e5), int(lon * 1e5), str(tz), *o))
     rows.sort()
-    t = pa.table({
+    cols = {
         "ident": [r[0] for r in rows],
         "lat": pa.array([r[1] for r in rows], pa.int32()),
         "lon": pa.array([r[2] for r in rows], pa.int32()),
         "tz": [r[3] for r in rows],
-        "off_d0": pa.array([r[4] for r in rows], pa.int16()),
-        "off_dm1": pa.array([r[5] for r in rows], pa.int16()),
-        "off_dm2": pa.array([r[6] for r in rows], pa.int16()),
-    })
+    }
+    for i, name in enumerate(names):
+        cols[name] = pa.array([r[4 + i] for r in rows], pa.int16())
+    t = pa.table(cols)
     ap_path = os.path.join(out_dir, "airports_utc.parquet")
     pq.write_table(t, ap_path, compression="zstd", use_dictionary=["tz", "ident"])
 
@@ -333,6 +350,11 @@ def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
     meta = {
         "date": date,
         "airports": len(rows),
+        # the offset columns in airports_utc.parquet and the date each one
+        # resolves, so a client maps date -> column by lookup and never has to
+        # reproduce the d0/dm1 naming arithmetic
+        "tz_columns": names,
+        "tz_dates": [(d0 - dt.timedelta(days=k)).isoformat() for k in ks],
         # tier 2: block_min = fixed + 60 * gc_km / kmh
         "block_fixed_min": round(fixed, 2),
         "block_kmh": round(kmh, 1),
@@ -353,10 +375,12 @@ def emit_client(airports, date, out_dir, coef, table_date=None, n_legs=0):
     # verify_bundle.py gating the bundle
     back = pq.read_table(ap_path)
     assert back.num_rows == len(rows), "airports_utc.parquet row count changed"
+    d0_i = 4 + names.index("off_d0")
     chk = dict(zip(back["ident"].to_pylist(), back["off_d0"].to_pylist()))
-    for ident, _, _, _, o0, _, _ in rows[:200]:
-        assert chk[ident] == o0, f"offset round-trip failed for {ident}"
-    print(f"{len(rows)} airports -> {ap_path} "
+    for r in rows[:200]:
+        assert chk[r[0]] == r[d0_i], f"offset round-trip failed for {r[0]}"
+    print(f"{len(rows)} airports x {len(names)} dates "
+          f"({meta['tz_dates'][-1]} .. {meta['tz_dates'][0]}) -> {ap_path} "
           f"({os.path.getsize(ap_path)/1024:.1f} KB, round-trip ok)")
     print(f"  -> {meta_path}  block_min = {fixed:.1f} + 60*d/{kmh:.0f}"
           f"{'' if table_date else '   (no settled table this run)'}")
@@ -381,6 +405,11 @@ def main():
                    help="write airports_utc.parquet + overnight_meta.json for "
                         "static clients")
     p.add_argument("--date", help="partition date YYYY-MM-DD, for --emit-client")
+    p.add_argument("--tz-back", type=int, default=2, metavar="N",
+                   help="resolve UTC offsets for D+1, D and the N days before "
+                        "it (default %(default)s). Set it to the retention "
+                        "window and one copy of the table answers every local "
+                        "date the archive still holds")
     p.add_argument("--table-date",
                    help="the date --build-table's legs cover, recorded in "
                         "overnight_meta.json; omit if no settled table")
@@ -404,7 +433,7 @@ def main():
             sys.exit("--emit-client needs --date")
         os.makedirs(a.emit_client, exist_ok=True)
         emit_client(airports, a.date, a.emit_client, coef,
-                    a.table_date, len(legs) if legs else 0)
+                    a.table_date, len(legs) if legs else 0, a.tz_back)
     if not (a.dep and a.arr and a.arr_local):
         return
 
