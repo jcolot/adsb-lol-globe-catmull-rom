@@ -24,11 +24,15 @@ hour?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages
 
-1. **`fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`.
-   Per-second decimation (mean position **and** time), stationary-gate snapping,
-   ground-elevation reference, greedy CR-node placement.
+1. **`fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`, plus
+   `callsigns.parquet` and `events.parquet`. Per-second decimation (mean position
+   **and** time), stationary-gate snapping, ground-elevation reference, greedy
+   CR-node placement. **`events.parquet` has no consumer yet** — `build_legs.py`
+   reads `callsigns.parquet` but not the gate dwells and airborne runs, so that
+   file is written and unread.
 2. **`build_legs.py`** — `nodes.parquet → legs/` (per-airport partitions +
-   `flights.parquet` index).
+   `flights.parquet` index), stamping the callsign from `callsigns.parquet` onto
+   each leg.
 3. **`build_hexes.py`** — `points_legs.parquet → traffic-raster.pmtiles` (H3
    traffic density as a raster overview; `hex_raster.py` renders it). The vector
    hexbin archive is optional and **off by default** — see below.
@@ -70,7 +74,8 @@ pip install -r requirements.txt
 python3 fit_spline.py path/to/traces --ground-elevation \
     --parquet nodes --tol-ground 2 --tol-cruise 150 --corner 35
 python3 build_legs.py --traces nodes/nodes.parquet \
-    --meta nodes/aircraft.parquet --out-dir out/legs
+    --meta nodes/aircraft.parquet --callsigns nodes/callsigns.parquet \
+    --out-dir out/legs
 python3 build_hexes.py --points out/legs/points_legs.parquet \
     --out out/legs/traffic.pmtiles
 python3 build_bundle.py --points out/legs/points_legs.parquet \

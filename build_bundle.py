@@ -667,6 +667,9 @@ def main():
 
     meta = dict(
         date=day.isoformat(), version=1,
+        # cells.bin's own format version, so a client can tell from the manifest
+        # whether its reader matches without fetching the index first
+        index_version=IDX_VERSION,
         n_legs=n_legs, n_nodes=n_nodes,
         index_res=a.index_res, index_cells=n_cells, index_pairs=n_pairs,
         index_groups=n_groups,
