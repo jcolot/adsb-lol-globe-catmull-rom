@@ -25,7 +25,7 @@ Usage:
     ./smooth_trace.py subset_ebbr/traces --out subset_smooth [--ground-elevation]
     ./smooth_trace.py path/to/trace_full_XXXX.json --dump      # print one track
 """
-import argparse, math, os, sys
+import argparse, glob, math, os, sys
 import numpy as np
 import importlib.util
 
@@ -95,14 +95,19 @@ def parse(d, elev_fn=None):
         # readsb emits the aircraft-details object only on the samples where a
         # field CHANGED, so `flight` is sparse and its index varies by trace
         # variant (8 = details, 9 = source type; some writers shift them). Scan
-        # both for a dict carrying a callsign rather than assuming a position.
+        # both for a dict CARRYING A CALLSIGN -- stopping at the first dict is
+        # not the same thing and silently drops callsigns, because index 9 is
+        # itself a dict in the common variant (see `src` above): a writer that
+        # puts the source type at 8 would end the scan before the details object
+        # at 9 was ever looked at, and so would a details object whose `flight`
+        # is absent or blank on this particular sample.
         flight = None
         for k in (8, 9):
             if len(p) > k and isinstance(p[k], dict):
                 f = p[k].get("flight")
                 if isinstance(f, str) and f.strip():
                     flight = f.strip()
-                break
+                    break
         ms.append(dict(t=t, lat=p[1], lon=p[2], gnd=gnd, baro=baro, geom=geom,
                        gs=gs, trk=trk, vr=vr, src=src, flight=flight))
     return ms
