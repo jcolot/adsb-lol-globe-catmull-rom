@@ -3,9 +3,10 @@
 For the frontend agent. Everything below is measured against the live bucket,
 data date **2026-09-20** (113,522 legs, 12.46 M nodes).
 
-> **Updated for `cells.bin` v2.** The index is now keyed by `(cell, hour)`, not
-> just `(cell)`, which is what makes this query cheap. Read **The header moved**
-> below before porting a v1 reader — the layout changed and so did the offsets.
+> **Updated for `cells.bin` v3.** The index is keyed by `(cell, hour)`, not just
+> `(cell)`, which is what makes this query cheap, and it carries a **res-0
+> directory** so you can range-read one region instead of the whole file. Read
+> **The header moved** below before porting an older reader.
 
 ## The one-paragraph answer
 
@@ -50,7 +51,8 @@ Key facts from `meta.json`, all of which you should read rather than hardcode:
 | `step_km` | `11.305` | spacing the index sampled the curve at |
 | `index_buckets` | `24` | time buckets per day in `cells.bin` |
 | `bucket_ds` | `36000` | bucket width in deciseconds (36,000 ds = 1 h) |
-| `index_groups` | `1137857` | distinct `(cell, bucket)` pairs |
+| `index_groups` | `1137858` | distinct `(cell, bucket)` pairs |
+| `index_res0` | `120` | res-0 cells with traffic (of 122) |
 
 `lid` **is the row index** in `legs.parquet` — verified true on this day — so a
 posting list indexes the leg table directly with no map.
@@ -128,9 +130,16 @@ export async function loadDay(date) {
 
 ### `cells.bin` reader
 
-**The header moved.** v2 added `n_buckets`, `n_groups` and `bucket_ds`, and the
-tables now start at **offset 28**, not 20. A v1 reader pointed at a v2 file
+**The header moved, twice.** v2 added `n_buckets`, `n_groups` and `bucket_ds`;
+v3 added `n_res0` plus a res-0 directory, so the header is 32 bytes and the
+directory sits between it and `cell[]`. An old reader pointed at a v3 file
 returns plausible garbage rather than failing loudly, so check `version` first.
+
+The reader below loads the file whole, which is the simple path and what you
+should start with. If a regional view makes 15 MB per day too much, the same
+directory lets you range-read one res-0 cell instead: measured at **1.38 MB in
+7 range requests, 9.2% of the file**, with answers identical to the whole-file
+reader. See the res-0 directory section in the README for the byte layout.
 
 **Do not assume 24 buckets.** The bucket *width* is fixed; the *count* follows
 the data span. A single UTC day gives 24 hourly buckets, but a bundle stitched
@@ -144,16 +153,25 @@ export class CellIndex {
     if (new TextDecoder().decode(u8.subarray(0, 8)) !== 'ADSBIDX1')
       throw new Error('cells.bin: bad magic');
     this.version = u8[8];
-    if (this.version !== 2)
-      throw new Error(`cells.bin v${this.version}: this reader wants v2`);
+    if (this.version !== 3)
+      throw new Error(`cells.bin v${this.version}: this reader wants v3`);
     this.res       = u8[9];
     this.nBuckets  = u8[10];
     this.nCells    = dv.getUint32(12, true);
     this.nLegs     = dv.getUint32(16, true);
     this.nGroups   = dv.getUint32(20, true);
     this.bucketDs  = dv.getUint32(24, true);   // bucket WIDTH in deciseconds
-    let o = 28;
-    // GOTCHA: 28 is not 8-byte aligned, so `new BigUint64Array(buf, 28, n)`
+    this.nRes0     = dv.getUint32(28, true);
+    // the res-0 directory: skip it for a whole-file read, use it to range-read
+    // one region (see the README). Kept here so the offsets below are right.
+    let o = 32;
+    this.dirCell = new BigUint64Array(buf.slice(o, o + 8 * this.nRes0));
+    o += 8 * this.nRes0;
+    this.dirCoff = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
+    o += 4 * (this.nRes0 + 1);
+    this.dirGlen = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
+    o += 4 * (this.nRes0 + 1);
+    // GOTCHA: this offset is not 8-byte aligned, so `new BigUint64Array(buf, o, n)`
     // throws "start offset of BigUint64Array should be a multiple of 8" unless
     // the ArrayBuffer itself starts 8-aligned. slice() copies into a fresh,
     // aligned buffer -- 1.3 MB, once per day. Do the same for safety.

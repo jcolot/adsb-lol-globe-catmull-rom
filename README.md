@@ -614,7 +614,7 @@ date). This matters: `nodes.parquet` stores `t` relative to each *aircraft's*
 ```
 offset   size               field
 0        8                  magic "ADSBIDX1"
-8        1                  version    2
+8        1                  version    3
 9        1                  res        H3 resolution (default 4)
 10       1                  n_buckets  time buckets, DERIVED from the span
 11       1                  — padding —
@@ -622,7 +622,11 @@ offset   size               field
 16       4                  n_legs     uint32
 20       4                  n_groups   uint32, distinct (cell, bucket) pairs
 24       4                  bucket_ds  uint32, bucket WIDTH in deciseconds
-28       8 x n_cells        cell[]     uint64, ascending H3 index
+28       4                  n_res0     uint32, res-0 cells with traffic
+32       8 x n_res0         dir_cell[] uint64, ascending res-0 H3 index
+…        4 x (n_res0+1)     dir_coff[] uint32 prefix index into cell[]
+…        4 x (n_res0+1)     dir_glen[] uint32 prefix BYTE offset into glen[]
+…        8 x n_cells        cell[]     uint64, ascending H3 index
 …        4 x (n_cells+1)    goff[]     uint32 prefix offsets into bucket[]/glen[]
 …        4 x (n_cells+1)    coff[]     uint32 byte offset in post[] of the
                                        cell's FIRST group
@@ -654,6 +658,41 @@ covers the span and that the last bucket is not a dumping ground.
 `n_buckets` is a `uint8`, so hourly reaches 255 hours ≈ 10 days; past that the
 build fails and tells you to widen the bucket. A reader must take `bucket_ds`
 and `n_buckets` from the header and never derive them from 86,400.
+
+### The res-0 directory — range-read a viewport, don't fetch the world
+
+Because cells are sorted by H3 index, every **res-0** cell's descendants form
+exactly one contiguous run of `cell[]`. `dir_cell[]` names the res-0 cells that
+carry traffic and the two prefix arrays give each one's slice, so a client
+binary-searches the directory and range-reads only the region it is showing.
+
+Measured on 2026-09-20: **120 of the 122** res-0 cells carry traffic, the
+directory costs **1.9 KB** of a 15.34 MB index (0.012%), and reading the res-0
+cell containing Brussels takes **1.38 MB in 7 range requests — 9.2% of the
+file** — returning answers identical to the whole-file reader on all 2,399 of
+its res-4 cells, all-day and for a 15-minute window.
+
+Partitioning this way costs **nothing**: every res-4 cell has exactly one res-0
+parent, so `cell[]`, `goff[]` and `coff[]` divide with no overlap. A split by
+hour cannot do that — it duplicates the cell table, and measured at 1.58×.
+Traffic is very unevenly spread, which helps here: largest partition 1.41 MB,
+median **14 KB**, top 3 res-0 cells holding 29% of all postings.
+
+`dir_glen[]` is what makes the directory usable rather than decorative. `glen[]`
+is a varint *stream*, so without a per-partition byte offset a client would have
+to decode every length from the start of the file to find its own groups.
+
+This is the same shape as PMTiles — one object, directory in the header,
+spatially clustered payload, HTTP range reads — but keyed by H3 rather than by
+Mercator tiles, because the two grids do not nest: a res-4 hexagon straddles
+tile edges, so a tile-keyed index would duplicate posting lists and fragment
+the gap coding that gets them to 1.36 B/pair.
+
+Note what this does **not** solve. One res-0 partition still references 16–21%
+of all legs (Brussels' holds 20,787 of 113,522), and `legs.parquet` is ordered
+by `(dep, t0)` rather than geographically, so those rows are scattered through
+it. A regional view is therefore ~1.4 MB of index plus whatever it takes to get
+leg metadata — the whole 4.6 MB today.
 
 Cells stay sorted by H3 index because a parent's descendants form exactly **one**
 contiguous run in that order, so "everything under this cell" is a single slice

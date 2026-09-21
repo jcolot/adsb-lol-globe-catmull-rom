@@ -5,7 +5,8 @@ make every flight findable and every "what flew through this box?" answerable.
 
     meta.json      manifest: units, counts, file sizes
     legs.parquet   one row per leg -- SHIPPED WHOLE, held in memory
-    cells.bin      H3 inverted index, (cell, hour) -> legs -- SHIPPED WHOLE
+    cells.bin      H3 inverted index, (cell, hour) -> legs -- shipped whole, or
+                   range-read per res-0 cell via its directory
     tracks.bin     per-leg delta-varint node records -- RANGE-READ
 
 The design turns on one observation: the two queries want different structures,
@@ -54,7 +55,7 @@ def _arrow(rel):
 
 
 MAGIC = b"ADSBIDX1"
-IDX_VERSION = 2                 # 2 added the time-bucket dimension to cells.bin
+IDX_VERSION = 3                 # 2 added time buckets, 3 the res-0 directory
 Q_POS = 1e5                     # points_legs lat/lon are degrees * 1e5
 DAY_DS = 86400 * 10             # deciseconds in a day -- the bucketing domain
 
@@ -466,16 +467,56 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
     # reader may expand the lengths back to a flat array in memory, which is the
     # point -- the wire is the scarce side, not the heap.
     glen = np.diff(poff.astype(np.int64)).astype(np.uint64)
-    glen_buf, _ = varint_encode(glen)
+    glen_buf, glen_nb = varint_encode(glen)
     coff = poff[goff]           # byte offset of each cell's FIRST group
+
+    # ---- res-0 directory -------------------------------------------------
+    # Cells are sorted by H3 index, so every res-0 cell's descendants form ONE
+    # contiguous run of cell[] -- the same property that lets a client pick its
+    # covering resolution by zoom. That makes a viewport-sized slice of this
+    # index addressable without splitting the file: 120 of the 122 res-0 cells
+    # carry traffic on a real day, the biggest holds 1.41 MB of a 15.34 MB
+    # index, and the median holds 14 KB. Partitioning costs NOTHING because
+    # every res-4 cell has exactly one res-0 parent, so cell[]/goff[]/coff[]
+    # divide with no overlap -- unlike a split by hour, which duplicates the
+    # cell table and inflated 1.58x when measured.
+    #
+    # dir_glen_off is the part that makes this usable rather than decorative:
+    # glen[] is a varint STREAM, so without a per-partition byte offset a
+    # client would have to decode every length from the start of the file to
+    # locate its own groups, which defeats the point of the directory.
+    con.register("ucell_t", pa.table({"i": np.arange(len(ucell), dtype=np.int64),
+                                      "cell": ucell}))
+    p0 = _arrow(con.execute(
+        "SELECT h3_cell_to_parent(cell, 0) AS p0 FROM ucell_t ORDER BY i"
+    )).column("p0").to_numpy(zero_copy_only=False).astype(np.uint64)
+    con.unregister("ucell_t")
+    r_start = np.concatenate(([0], np.flatnonzero(p0[1:] != p0[:-1]) + 1))
+    dir_cell = p0[r_start]
+    # These are load-bearing, not decoration: a client binary-searches the
+    # directory and slices, so a parent appearing twice or out of order would
+    # silently return a subset of a region's traffic.
+    if len(dir_cell) != len(np.unique(dir_cell)):
+        raise ValueError("a res-0 parent owns more than one run of cell[]")
+    if not (dir_cell[1:] > dir_cell[:-1]).all():
+        raise ValueError("res-0 parents are not ascending in cell[] order")
+    dir_coff = np.concatenate((r_start, [len(ucell)])).astype(np.uint32)
+    glen_cum = np.concatenate(([0], np.cumsum(glen_nb))).astype(np.int64)
+    dir_glen = np.concatenate(
+        (glen_cum[goff[dir_coff[:-1]].astype(np.int64)], [len(glen_buf)])
+    ).astype(np.uint32)
 
     n_legs = con.execute("SELECT count(*) FROM leg").fetchone()[0]
     with open(path, "wb") as f:
         f.write(MAGIC)
         # bucket_ds lives in the header, not just meta.json: a reader that has
         # the index has everything it needs to map a time to a bucket.
-        f.write(struct.pack("<BBBBIIII", IDX_VERSION, index_res, n_buckets, 0,
-                            len(ucell), n_legs, len(gstarts), int(bucket_ds)))
+        f.write(struct.pack("<BBBBIIIII", IDX_VERSION, index_res, n_buckets, 0,
+                            len(ucell), n_legs, len(gstarts), int(bucket_ds),
+                            len(dir_cell)))
+        f.write(dir_cell.astype("<u8").tobytes())
+        f.write(dir_coff.astype("<u4").tobytes())
+        f.write(dir_glen.astype("<u4").tobytes())
         f.write(ucell.astype("<u8").tobytes())
         f.write(goff.astype("<u4").tobytes())
         f.write(coff.astype("<u4").tobytes())
@@ -487,8 +528,10 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
         f"({len(gstarts)/len(ucell):.2f}/cell), {len(lid)} pairs, "
         f"{len(post)/len(lid):.2f} B/pair "
         f"(post {len(post)/1e6:.2f} MB, cells {8*len(ucell)/1e6:.2f}, "
-        f"group tables {(8*len(ucell)+len(gbkt)+len(glen_buf))/1e6:.2f})")
-    return len(ucell), len(lid), len(gstarts), n_buckets
+        f"group tables {(8*len(ucell)+len(gbkt)+len(glen_buf))/1e6:.2f}, "
+        f"res-0 dir {len(dir_cell)} entries / "
+        f"{(8*len(dir_cell)+8*(len(dir_cell)+1))/1024:.1f} KB)")
+    return len(ucell), len(lid), len(gstarts), n_buckets, len(dir_cell)
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +657,7 @@ def main():
         f"({legs_bytes/max(n_legs,1):.1f} B/leg)")
 
     cells = os.path.join(a.out_dir, "cells.bin")
-    n_cells, n_pairs, n_groups, n_buckets = write_cells(
+    n_cells, n_pairs, n_groups, n_buckets, n_res0 = write_cells(
         con, a.points, cells, a.index_res, step_km, a.buckets, has_cusp,
         bucket_ds, log)
 
@@ -628,6 +671,9 @@ def main():
         # derived from the span, so it is 24 for a single UTC day and more for a
         # stitched one. Both are also in the cells.bin header.
         index_buckets=n_buckets, bucket_ds=int(bucket_ds),
+        # res-0 cells with traffic; each is one contiguous slice of the index,
+        # so a client can range-read a viewport instead of the whole file
+        index_res0=n_res0,
         q_pos=int(Q_POS), t_unit="ds", t_epoch=epoch,
         t_epoch_iso=datetime.datetime.fromtimestamp(
             epoch, datetime.timezone.utc).isoformat().replace("+00:00", "Z"),

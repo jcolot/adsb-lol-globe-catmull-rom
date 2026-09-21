@@ -19,7 +19,7 @@ Checks, in order of how much they'd hurt to get wrong:
   4. structure   cells.bin header, ascending cells, monotonic offsets,
                  ascending posting lists, lid == row index in legs.parquet.
 """
-import argparse, importlib.util, json, os, random, struct, sys
+import argparse, bisect, importlib.util, json, os, random, struct, sys
 
 import duckdb
 import pyarrow.parquet as pq
@@ -90,6 +90,10 @@ class CellIndex:
     """cells.bin reader. The whole file is resident, so a lookup is a binary
     search over cell[] and a slice of post[].
 
+    v3 added a res-0 directory: every res-0 cell's descendants are ONE contiguous
+    run of cell[], so a client can binary-search dir_cell[] and range-read just
+    the slice covering its viewport instead of the whole file.
+
     v2 added a time dimension: a cell owns a run of GROUPS, one per time bucket
     it saw traffic in, and each group has its own posting list. Bucket b covers
     [b * bucket_ds, (b+1) * bucket_ds) deciseconds from meta.t_epoch. The WIDTH
@@ -117,13 +121,21 @@ class CellIndex:
             self.poff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
             o += 4 * (self.n_cells + 1)
             self.coff = self.poff[:-1] + [self.poff[-1]]
-        elif self.version == 2:
+            self.n_res0 = 0
+            self.dir_cell, self.dir_coff, self.dir_glen = [], [0], [0]
+        elif self.version == 3:
             self.res, self.n_buckets, _, self.n_cells, self.n_legs, \
-                self.n_groups, self.bucket_ds = \
-                struct.unpack_from("<BBBIIII", blob, 9)
-            # "<BBBBIIII" after the 8-byte magic is 20 bytes with no padding,
-            # so the tables start at 28.
-            o = 28
+                self.n_groups, self.bucket_ds, self.n_res0 = \
+                struct.unpack_from("<BBBIIIII", blob, 9)
+            # "<BBBBIIIII" after the 8-byte magic is 24 bytes with no padding,
+            # so the res-0 directory starts at 32 and the tables after it.
+            o = 32
+            self.dir_cell = list(struct.unpack_from(f"<{self.n_res0}Q", blob, o))
+            o += 8 * self.n_res0
+            self.dir_coff = list(struct.unpack_from(f"<{self.n_res0 + 1}I", blob, o))
+            o += 4 * (self.n_res0 + 1)
+            self.dir_glen = list(struct.unpack_from(f"<{self.n_res0 + 1}I", blob, o))
+            o += 4 * (self.n_res0 + 1)
             self.cells = list(struct.unpack_from(f"<{self.n_cells}Q", blob, o))
             o += 8 * self.n_cells
             self.goff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
@@ -137,10 +149,12 @@ class CellIndex:
             # its own coff[], so a corrupt length cannot walk off into the
             # next cell's postings unnoticed -- the structure check below
             # compares the two.
+            glen_base = o
             glen = []
             for _g in range(self.n_groups):
                 v, o = read_varint(blob, o)
                 glen.append(v)
+            self.glen_off = glen_base      # where glen[] starts, for the dir check
             base = o
             self.poff = [0] * (self.n_groups + 1)
             for i in range(self.n_cells):
@@ -153,6 +167,19 @@ class CellIndex:
         else:
             raise ValueError(f"cells.bin version {self.version} not supported")
         self.post = blob[o:]
+        self.post_blob = blob
+
+    def _glen_byte_of(self, group):
+        """Byte offset of `group`'s length varint inside glen[]. Only the
+        verifier needs this -- a client reaches its groups through the res-0
+        directory instead of walking from zero."""
+        if not hasattr(self, "_glen_cum"):
+            cum, o = [0], self.glen_off
+            for _g in range(self.n_groups):
+                _v, o = read_varint(self.post_blob, o)
+                cum.append(o - self.glen_off)
+            self._glen_cum = cum
+        return self._glen_cum[group]
 
     def _find(self, cell):
         lo, hi = 0, self.n_cells - 1
@@ -306,6 +333,43 @@ def main():
           all(len(p) > 0 and all(p[k] < p[k + 1] for k in range(len(p) - 1))
               and p[-1] < idx.n_legs
               for p in (idx._decode(g) for g in range(idx.n_groups))))
+    # ---- the res-0 directory -------------------------------------------
+    # This is load-bearing: a client binary-searches it and slices, so a wrong
+    # offset does not crash, it silently returns a subset of a region's traffic.
+    if idx.version >= 3:
+        check("res-0 directory count matches meta",
+              idx.n_res0 == meta["index_res0"], f"{idx.n_res0} cells")
+        check("res-0 cells ascending, no duplicates",
+              all(idx.dir_cell[i] < idx.dir_cell[i + 1]
+                  for i in range(idx.n_res0 - 1)))
+        check("res-0 runs tile cell[] exactly",
+              idx.dir_coff[0] == 0 and idx.dir_coff[-1] == idx.n_cells
+              and all(idx.dir_coff[i] < idx.dir_coff[i + 1]
+                      for i in range(idx.n_res0)))
+        # every cell in a run must really be a child of that run's res-0 cell
+        rows = con.execute(f"""
+            SELECT h3_cell_to_parent(cell::UBIGINT, 0) FROM (VALUES {
+                ','.join(f'({c})' for c in idx.cells[::max(1, idx.n_cells // 4000)])
+            }) AS t(cell)""").fetchall()
+        probe = list(range(0, idx.n_cells, max(1, idx.n_cells // 4000)))
+        bad = 0
+        for ci, (par,) in zip(probe, rows):
+            k = bisect.bisect_right(idx.dir_coff, ci) - 1
+            if not (0 <= k < idx.n_res0) or idx.dir_cell[k] != par:
+                bad += 1
+        check(f"each cell falls in its own res-0 run ({len(probe)} sampled)",
+              bad == 0, f"{bad} misplaced")
+        # glen offsets must land exactly on the partition's first group
+        gl = idx.glen_off
+        bad_g = 0
+        for k in range(idx.n_res0):
+            want = idx.goff[idx.dir_coff[k]]
+            pos, g = gl + idx.dir_glen[k], 0
+            # decode forward from byte 0 of glen[] only once, then compare
+            bad_g += 0 if idx.dir_glen[k] == idx._glen_byte_of(want) else 1
+        check("res-0 glen offsets point at the run's first group", bad_g == 0,
+              f"{bad_g} wrong")
+
     check("file sizes match meta",
           all(os.path.getsize(os.path.join(a.bundle, v["path"])) == v["bytes"]
               for v in meta["files"].values()))
