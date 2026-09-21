@@ -53,9 +53,9 @@ through it. **`cells.bin` is your choice**, and the tradeoff is real:
 | | load whole | range-read per res-0 cell |
 |---|---|---|
 | up front | 15.3 MB (v1 day: 8.3 MB) | nothing |
-| first click in a region | 0 requests | 22.5 KB, ~5 requests |
-| each further click there | 0 requests, instant | 2.4 KB, ~3 requests |
-| a click in a new region | 0 requests | another 22.5 KB |
+| first click in a region | 0 requests | 22.5 KiB, 6 requests |
+| each further click there | 0 requests, instant | 2.4 KiB, 4 requests |
+| a click in a new region | 0 requests | another 20.2 KiB of scaffolding |
 | whole-world view | already have it | would fetch most of the file anyway |
 
 **Load whole if the view is the globe, or if the user will roam.** One fetch and
@@ -83,7 +83,7 @@ Key facts from `meta.json`, all of which you should read rather than hardcode:
 | `step_km` | `11.305` | spacing the index sampled the curve at |
 | `index_buckets` | `24` | time buckets per day in `cells.bin` |
 | `bucket_ds` | `36000` | bucket width in deciseconds (36,000 ds = 1 h) |
-| `index_groups` | `1137858` | distinct `(cell, bucket)` pairs |
+| `index_groups` | `1137849` | distinct `(cell, bucket)` pairs |
 | `index_res0` | `120` | res-0 cells with traffic (of 122) |
 
 `lid` **is the row index** in `legs.parquet` — verified true on this day — so a
@@ -99,13 +99,13 @@ Measured on 2026-09-20, window 12:00–12:15 UTC unless noted:
 | 2. + leg span overlaps window | 388 | 760 | 169 | 452 |
 | 3. + a **visit** overlaps window | **48** | **106** | **7** | **108** |
 | stage 2 over-report | **8.1×** | **7.2×** | **24.1×** | 4.2× |
-| stage 3 cost | 388 reads / 577 KiB | 760 / 1.26 MiB | 169 / 304 KiB | 452 / 644 KiB |
-| matching visit dwell, median | 7.1 min | 15.4 min | 2.2 min | 4.2 min |
+| stage 3 cost | 388 reads / 577 KiB | 760 / 1,260 KiB | 169 / 304 KiB | 452 / 644 KiB |
+| matching visit dwell, median | 6.9 min | 17.8 min | 2.2 min | 3.7 min |
 
 Two things to read off that table. The over-report is **worst exactly where the
 question is most interesting** — an enroute cell, where the aircraft is present
 for 2 minutes out of a 10-hour leg. And stage 3 is affordable: a few hundred
-range reads over ~0.5–1.3 MiB, not a re-download.
+range reads over 304–1,278 KiB, not a re-download.
 
 ## Stage 3 is per-*visit*, not per-leg min/max
 
@@ -175,8 +175,8 @@ The reader below loads the file whole, which is the simple path and what you
 should start with. For the click-a-cell interaction you do not have to: `coff[]`
 gives each cell's byte range in `post[]` and every group inside announces its own
 pair count, so a click needs `goff[j..j+1]`, `coff[j..j+1]`, its `bucket[]` bytes
-and its postings — measured at **22.5 KB for the first click in a region and
-2.4 KB for each one after**, against a 15.34 MB file. The res-0 directory is how
+and its postings — measured at **22.5 KiB in 6 ranges for the first click in a
+region and 2.4 KiB in 4 for each one after**, against a 15.34 MB file. The res-0 directory is how
 you find the region. See the README for the byte layout.
 
 **Do not assume 24 buckets.** The bucket *width* is fixed; the *count* follows
@@ -444,7 +444,7 @@ payload):
 
 **4 KiB is the setting.** It removes 40% of the requests for 20% more bytes;
 everything above 16 KiB trades badly. Do not "optimise" this into one big
-request — the candidates span 85 of the file's 94 MB.
+request — the candidates span 89.6 of the file's 94 MB.
 
 ```js
 async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
@@ -481,8 +481,11 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
    ring-expanded set missed none.
 
 2. **The index is exact at cell granularity, approximate below it.** Res 4 is
-   ~45 km across. For a box tighter than a cell, expect 17–22% false positives
-   and refine against the leg bbox and then the geometry. There are **never**
+   ~45 km across. `verify_bundle.py` measured **14%** false positives over 24
+   random boxes of 1°–25° on 2026-09-20; the README reports **17–22%** for a box
+   tighter than a cell, which is the harder case and the one you will hit. The
+   share grows as the box shrinks, so refine against the leg bbox and then the
+   geometry. There are **never**
    false negatives — that is the property `verify_bundle.py` asserts.
 
 3. **A leg's span is not its dwell — but the index now knows that.** Filtering
@@ -508,7 +511,7 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
    returns aircraft *inferred* to have crossed it, at inferred times — and the
    `gc` flag is set internally in `fit_spline.py` but **is not written to
    `nodes.parquet`**, so nothing downstream can distinguish it. My mid-Atlantic
-   test cell returned 31 legs from the index and 0 for a 15-minute window;
+   test cell returned 31 legs for the whole day and 3 for a 15-minute window;
    treat anything oceanic as modelled, not observed. Practical client-side
    heuristic: a node-to-node gap over ~150 km means that span is interpolated
    (land p90 is 55–116 km). If you need this properly, ask for the flag to be
@@ -564,7 +567,7 @@ What a v1 day cannot do, and what the reader does about it:
 | `get(cell, ds0, ds1)` | window **ignored**, returns the whole day | honours the window to the hour |
 | Brussels cell, 12:00–12:15 | 1,286 legs | **109 legs** |
 | res-0 directory | absent (`nRes0 === 0`) | 120 entries, range-readable |
-| cost of one cell click | whole file | ~2.4 KB |
+| cost of one cell click | whole file | ~2.4 KiB |
 | `flight` in `legs.parquet` | column absent | present, nullable |
 | `index_version` in `meta.json` | absent | `4` |
 
