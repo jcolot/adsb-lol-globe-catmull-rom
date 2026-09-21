@@ -14,7 +14,10 @@ Pipeline:
      nearest to its last (airports.csv, <=10 km). The anchor is a ground fix when
      the window has one, else the window's lowest fix, so airports with thin
      surface coverage still resolve;
-  4. write points_legs.parquet (one row/point, with dep/arr/leg_id),
+  4. stamp the callsign (callsigns.parquet) onto each leg: readsb reports `flight`
+     only when it CHANGES, so prefer the first change inside the leg (crews set it
+     at the stand) and otherwise carry forward the last one set before landing;
+  5. write points_legs.parquet (one row/point, with dep/arr/leg_id),
      flights.parquet (one row/leg = the index, sorted by dep),
      airports/airport=XXXX/*.parquet (each leg written under BOTH its dep and
      arr airport, carrying that leg's row from the index), and legs_meta.json
@@ -70,7 +73,9 @@ import pyarrow.parquet as pq
 #   2  + t_off, t_on, dep_gnd, arr_gnd, base_ts  (flights.parquet only)
 #   3  + those five in the per-airport files too, + legs_meta.json
 #   4  leg_id is "<date>_<icao>_<k>" -- globally unique, not just within a day
-FLIGHTS_SCHEMA = 4
+#   5  + flight, the callsign, on both (NULLable: readsb reports it only on
+#      change, so absence is not evidence of a callsign-less flight)
+FLIGHTS_SCHEMA = 5
 
 # What each per-airport row carries beyond the point itself. All five are
 # constant across a leg's run of rows, so RLE reduces them to a few bytes per
@@ -233,10 +238,58 @@ def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
     return dep, arr, dep_gnd, arr_gnd
 
 
+def _epoch_s(con, path, col):
+    """SQL that yields `col` as float epoch SECONDS. Absolute times are stored as
+    TIMESTAMP(ms, UTC), but the OOOI arithmetic below is plain float seconds -- so
+    unwrap once here rather than at every comparison. Pre-timestamp files (plain
+    integer seconds) still read correctly, instead of silently degrading to null."""
+    types = {c[0]: c[1].upper() for c in
+             con.execute(f"DESCRIBE SELECT * FROM '{path}'").fetchall()}
+    return f"epoch_ms({col}) / 1000.0" if "TIMESTAMP" in types.get(col, "") else col
+
+
+def load_callsigns(con, path):
+    """callsigns.parquet -> {icao: [(t, flight)]}, time-ordered."""
+    out = {}
+    if not path:
+        return out
+    try:
+        t = _epoch_s(con, path, "t")
+        rows = con.execute(f"SELECT icao, {t}, flight FROM '{path}' "
+                           f"ORDER BY icao, t").fetchall()
+    except duckdb.Error as e:
+        print(f"  no callsigns ({e}); flight will be null")
+        return out
+    for icao, tv, f in rows:
+        out.setdefault(icao, []).append((float(tv), f))
+    return out
+
+
+def flight_for_leg(changes, a0, a1, on):
+    """Callsign in effect for this leg. readsb reports `flight` only when it
+    CHANGES, so prefer the first change falling inside the leg (crews set it at
+    the stand, during taxi-out) and otherwise carry forward the last one set
+    before the aircraft landed."""
+    inside = [f for (t, f) in changes if a0 <= t <= a1 and f]
+    if inside:
+        return inside[0]
+    lim = on if on is not None else a1
+    carried = None
+    for (t, f) in changes:
+        if t > lim:
+            break
+        if f:
+            carried = f
+    return carried
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces", default="prod-0-parquet-single/traces.parquet")
     ap.add_argument("--meta", default="prod-0-parquet-single/aircraft.parquet")
+    ap.add_argument("--callsigns", default=None,
+                    help="callsigns.parquet (or glob) from fit_spline.py; "
+                         "without it the `flight` column stays NULL")
     ap.add_argument("--airports", default="airports.csv")
     ap.add_argument("--out-dir", default="airport_ds")
     ap.add_argument("--date", metavar="YYYY-MM-DD",
@@ -271,6 +324,7 @@ def main():
     day = resolve_date(a.date, meta)
     resolve = make_resolver(build_airport_index(a.airports))
     os.makedirs(a.out_dir, exist_ok=True)
+    cs_by = load_callsigns(con, a.callsigns)
 
     # carry the cusp bit through if the source has one (CR-fit output); the
     # frontend breaks its Catmull-Rom spline at cusp nodes for sharp corners
@@ -279,14 +333,15 @@ def main():
     has_cusp = "cusp" in src_cols
 
     pcols = ["icao", "t", "lat", "lon", "alt", "on_ground", "leg_id", "dep", "arr",
-             "reg", "type"] + (["cusp"] if has_cusp else [])
+             "reg", "type", "flight"] + (["cusp"] if has_cusp else [])
     pbuf = {c: [] for c in pcols}
     legs_rows = []
     pw = [None]
     pfields = [("icao", pa.string()), ("t", pa.int32()), ("lat", pa.int32()),
                ("lon", pa.int32()), ("alt", pa.int32()), ("on_ground", pa.bool_()),
                ("leg_id", pa.string()), ("dep", pa.string()), ("arr", pa.string()),
-               ("reg", pa.string()), ("type", pa.string())]
+               ("reg", pa.string()), ("type", pa.string()),
+               ("flight", pa.string())]
     if has_cusp:
         pfields.append(("cusp", pa.bool_()))
     pschema = pa.schema(pfields)
@@ -298,7 +353,7 @@ def main():
         if pw[0] is None:
             pw[0] = pq.ParquetWriter(pl_path, pschema, compression="zstd",
                                      use_dictionary=["icao", "leg_id", "dep", "arr",
-                                                     "reg", "type"])
+                                                     "reg", "type", "flight"])
         pw[0].write_table(pa.table(pbuf, schema=pschema))
         for c in pcols:
             pbuf[c] = []
@@ -331,6 +386,15 @@ def main():
             # approach fix rather than a real wheels event -- filter on the flags.
             s_air, e_air = airs[k]
             t_off, t_on = ts[s_air], ts[e_air]
+            # callsigns.parquet carries ABSOLUTE instants, while `ts` here is
+            # deciseconds past this aircraft's own base_ts, so the comparison
+            # has to happen in absolute seconds: base_ts + t/10. Without a
+            # base_ts column there is no common timeline and `flight` stays
+            # NULL rather than being matched against the wrong day.
+            changes = cs_by.get(icao, ()) if base is not None else ()
+            flight = (flight_for_leg(changes, base + ts[i0] / 10.0,
+                                     base + ts[i1] / 10.0, base + t_on / 10.0)
+                      if changes else None)
             leg_id = f"{day}_{icao}_{k}"
             for idx in range(i0, i1 + 1):
                 pbuf["icao"].append(icao); pbuf["t"].append(ts[idx])
@@ -338,9 +402,10 @@ def main():
                 pbuf["alt"].append(al[idx]); pbuf["on_ground"].append(gd[idx])
                 pbuf["leg_id"].append(leg_id); pbuf["dep"].append(dep); pbuf["arr"].append(arr)
                 pbuf["reg"].append(reg); pbuf["type"].append(typ)
+                pbuf["flight"].append(flight)
                 if has_cusp:
                     pbuf["cusp"].append(cu[idx])
-            legs_rows.append((leg_id, icao, reg, typ, dep, arr,
+            legs_rows.append((leg_id, icao, reg, typ, flight, dep, arr,
                               ts[i0], ts[i1], t_off, t_on,
                               dep_gnd, arr_gnd, base, i1 - i0 + 1))
         return len(legs)
@@ -377,15 +442,16 @@ def main():
     lt = pa.table({
         "leg_id": [x[0] for x in legs_rows], "icao": [x[1] for x in legs_rows],
         "reg": [x[2] for x in legs_rows], "type": [x[3] for x in legs_rows],
-        "dep": [x[4] for x in legs_rows], "arr": [x[5] for x in legs_rows],
-        "t_start": [x[6] for x in legs_rows], "t_end": [x[7] for x in legs_rows],
-        "t_off": [x[8] for x in legs_rows], "t_on": [x[9] for x in legs_rows],
-        "dep_gnd": [x[10] for x in legs_rows], "arr_gnd": [x[11] for x in legs_rows],
-        "base_ts": [x[12] for x in legs_rows],
-        "n_points": [x[13] for x in legs_rows],
+        "flight": [x[4] for x in legs_rows],
+        "dep": [x[5] for x in legs_rows], "arr": [x[6] for x in legs_rows],
+        "t_start": [x[7] for x in legs_rows], "t_end": [x[8] for x in legs_rows],
+        "t_off": [x[9] for x in legs_rows], "t_on": [x[10] for x in legs_rows],
+        "dep_gnd": [x[11] for x in legs_rows], "arr_gnd": [x[12] for x in legs_rows],
+        "base_ts": [x[13] for x in legs_rows],
+        "n_points": [x[14] for x in legs_rows],
     }).sort_by("dep")
     pq.write_table(lt, os.path.join(a.out_dir, "flights.parquet"),
-                   compression="zstd", use_dictionary=["dep", "arr", "type", "reg"])
+                   compression="zstd", use_dictionary=["dep", "arr", "type", "reg", "flight"])
     # joined into every per-airport file below, so one fetch carries both the
     # geometry and the five per-leg values a time query needs
     con.register("legidx", lt)

@@ -19,7 +19,7 @@ stable ground altitude, and no parked-at-gate "scribbles".
 It also builds two derived layers over the same day: **H3 traffic-density vector
 tiles** (`traffic.pmtiles`) for the world-zoom overview, and a **day bundle** —
 about 20 MB of index shipped up front that makes every flight findable by
-registration/hex/route and answers "which flights went through this box, in this
+callsign/registration/hex/route and answers "which flights went through this box, in this
 hour?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages

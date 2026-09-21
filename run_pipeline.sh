@@ -111,7 +111,8 @@ legs() {
     mkdir -p "$OUT"; rm -rf "$OUT/legs"
     python3 "$SCRIPT_DIR/build_legs.py" \
         --traces "$WORK/nodes/nodes.parquet" --date "$date" \
-        --meta "$WORK/nodes/aircraft.parquet" --out-dir "$OUT/legs"
+        --meta "$WORK/nodes/aircraft.parquet" \
+        --callsigns "$WORK/nodes/callsigns.parquet" --out-dir "$OUT/legs"
 }
 
 # Writes both archives INTO $OUT/legs so the existing upload picks them up with

@@ -114,8 +114,13 @@ def varint_one(x):
 def build_leg_table(con, points, meta, index_res, epoch_ds):
     """Ordered leg table. lid is assigned IN FINAL ROW ORDER, so lid == row index
     in legs.parquet and a posting list indexes the leg table directly."""
-    has_cusp = "cusp" in {r[0] for r in
-                          con.execute(f"DESCRIBE SELECT * FROM '{points}'").fetchall()}
+    pcols = {r[0] for r in
+             con.execute(f"DESCRIBE SELECT * FROM '{points}'").fetchall()}
+    has_cusp = "cusp" in pcols
+    # points_legs.parquet only grew a callsign at FLIGHTS_SCHEMA 5, so an older
+    # file has no such column. Treat it as NULL rather than failing: the bundle
+    # is still perfectly usable without it.
+    flight_expr = "p.flight" if "flight" in pcols else "NULL::VARCHAR AS flight"
     mcols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM '{meta}'").fetchall()}
     if "base_ts" not in mcols:
         sys.exit(f"{meta} has no base_ts column -- need aircraft.parquet from fit_spline.py")
@@ -123,7 +128,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
     con.execute(f"""
         CREATE OR REPLACE TABLE leg AS
         WITH n AS (
-            SELECT p.leg_id, p.icao, p.dep, p.arr, p.reg, p.type,
+            SELECT p.leg_id, p.icao, p.dep, p.arr, p.reg, p.type, {flight_expr},
                    p.lat, p.lon, p.alt, p.t,
                    -- rebase per-aircraft t onto one epoch
                    (p.t::BIGINT + m.base_ts::BIGINT * 10 - {epoch_ds}) AS tds,
@@ -134,6 +139,9 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                    any_value(icao) AS icao, any_value(dep) AS dep,
                    any_value(arr) AS arr,  any_value(reg) AS reg,
                    any_value(type) AS type,
+                   -- the callsign is stamped per leg by build_legs, so every
+                   -- node of a leg carries the same value
+                   any_value(flight) AS flight,
                    count(*)::INTEGER AS n_nodes,
                    -- constant within a leg (one leg is one aircraft); lets the
                    -- densifier's per-aircraft t be rebased with a single join
@@ -152,7 +160,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                     ORDER BY (dep IS NULL), coalesce(dep, ''),
                              CASE WHEN dep IS NULL THEN anchor ELSE 0::UBIGINT END,
                              t0, leg_id) - 1)::INTEGER AS lid,
-               leg_id, icao, dep, arr, reg, type, n_nodes,
+               leg_id, icao, dep, arr, reg, type, flight, n_nodes,
                t0::BIGINT AS t0, t1::BIGINT AS t1, t_shift,
                min_lat, max_lat, min_lon, max_lon, min_alt, max_alt, anchor
         FROM agg
@@ -543,7 +551,7 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
 # ---------------------------------------------------------------------------
 def write_legs(con, path, off, ln):
     t = con.execute("""
-        SELECT lid, icao, leg_id, reg, type, dep, arr,
+        SELECT lid, icao, leg_id, reg, type, flight, dep, arr,
                t0, t1, n_nodes,
                min_lat, max_lat, min_lon, max_lon, min_alt, max_alt
         FROM leg ORDER BY lid
@@ -554,6 +562,7 @@ def write_legs(con, path, off, ln):
     schema = pa.schema([
         ("lid", pa.uint32()), ("icao", pa.string()), ("leg_id", pa.string()),
         ("reg", pa.string()), ("type", pa.string()),
+        ("flight", pa.string()),
         ("dep", pa.string()), ("arr", pa.string()),
         ("t0", pa.uint32()), ("t1", pa.uint32()), ("n_nodes", pa.uint16()),
         ("min_lat", pa.int32()), ("max_lat", pa.int32()),
@@ -563,7 +572,7 @@ def write_legs(con, path, off, ln):
     t = t.cast(schema)
     pq.write_table(
         t, path, compression="zstd", version="2.6",
-        use_dictionary=["icao", "reg", "type", "dep", "arr"],
+        use_dictionary=["icao", "reg", "type", "flight", "dep", "arr"],
         # off/t0 are monotonic in row order and the bboxes correlate with the
         # (dep, t0) sort, so delta packing earns its keep on all of these
         column_encoding={c: "DELTA_BINARY_PACKED" for c in
