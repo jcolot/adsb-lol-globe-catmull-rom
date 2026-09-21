@@ -2,3 +2,6 @@ numpy
 pmtiles
 pyarrow
 duckdb
+# only so DuckDB can materialise the TIMESTAMPTZ OOOI columns as Python
+# datetimes in ad-hoc queries; the pipeline itself reads them via epoch_ms()
+pytz

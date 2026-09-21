@@ -92,8 +92,19 @@ def parse(d, elev_fn=None):
             src = p[9].get("type")
         elif len(p) > 9 and isinstance(p[9], str):
             src = p[9]
+        # readsb emits the aircraft-details object only on the samples where a
+        # field CHANGED, so `flight` is sparse and its index varies by trace
+        # variant (8 = details, 9 = source type; some writers shift them). Scan
+        # both for a dict carrying a callsign rather than assuming a position.
+        flight = None
+        for k in (8, 9):
+            if len(p) > k and isinstance(p[k], dict):
+                f = p[k].get("flight")
+                if isinstance(f, str) and f.strip():
+                    flight = f.strip()
+                break
         ms.append(dict(t=t, lat=p[1], lon=p[2], gnd=gnd, baro=baro, geom=geom,
-                       gs=gs, trk=trk, vr=vr, src=src))
+                       gs=gs, trk=trk, vr=vr, src=src, flight=flight))
     return ms
 
 
