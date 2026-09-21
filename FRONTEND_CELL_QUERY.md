@@ -3,11 +3,19 @@
 For the frontend agent. Everything below is measured against the live bucket,
 data date **2026-09-20** (113,522 legs, 12.46 M nodes).
 
-> **Updated for `cells.bin` v4.** The index is keyed by `(cell, hour)`, not just
-> `(cell)`, which is what makes this query cheap; it carries a **res-0 directory**
-> so you can range-read one region instead of the whole file; and each group
-> states its own length, so **one cell click costs ~2.4 KB**. Read **The header
-> moved** below before porting an older reader.
+> **Reads `cells.bin` v1 and v4.** v4 keys the index by `(cell, hour)` rather
+> than `(cell)`, which is what makes this query cheap; carries a **res-0
+> directory** so you can range-read one region instead of the whole file; and
+> lets each group state its own length, so **one cell click costs ~2.4 KB**.
+>
+> **The bucket will hold both versions for a while.** The retained days on R2
+> were built at v1 and are not rewritten; only days built from the next pipeline
+> run onward are v4, so the day picker spans a mix until v1 days age out of
+> `RETENTION_DAYS`. The reader below handles both and exposes `timeIndexed`,
+> which is **false** on a v1 day — there `get()` ignores your time window and
+> you must fall back to the leg-span prune or the geometry pass. Both paths are
+> tested against the real live v1 file and a real v4 build; see **Version
+> transition** below.
 
 ## The one-paragraph answer
 
@@ -113,6 +121,7 @@ export async function loadDay(date) {
       legs.off = new Float64Array(n); legs.len = new Uint32Array(n);
       legs.icao = new Array(n); legs.dep = new Array(n); legs.arr = new Array(n);
       legs.reg = new Array(n); legs.type = new Array(n);
+      legs.flight = new Array(n);          // callsign, nullable
       for (let i = 0; i < n; i++) {
         const r = rows[i];
         // lid IS the row index; don't build a map, but do assert it once
@@ -122,6 +131,8 @@ export async function loadDay(date) {
         legs.len[i] = r.len;
         legs.icao[i] = r.icao; legs.dep[i] = r.dep; legs.arr[i] = r.arr;
         legs.reg[i] = r.reg; legs.type[i] = r.type;
+        // absent entirely on days built before the callsign existed
+        legs.flight[i] = r.flight ?? null;
       }
     },
   });
@@ -157,36 +168,58 @@ export class CellIndex {
     if (new TextDecoder().decode(u8.subarray(0, 8)) !== 'ADSBIDX1')
       throw new Error('cells.bin: bad magic');
     this.version = u8[8];
-    if (this.version !== 4)
-      throw new Error(`cells.bin v${this.version}: this reader wants v4`);
-    this.res       = u8[9];
-    this.nBuckets  = u8[10];
-    this.nCells    = dv.getUint32(12, true);
-    this.nLegs     = dv.getUint32(16, true);
-    this.nGroups   = dv.getUint32(20, true);
-    this.bucketDs  = dv.getUint32(24, true);   // bucket WIDTH in deciseconds
-    this.nRes0     = dv.getUint32(28, true);
-    let o = 32;
-    // The res-0 directory. Skip it for a whole-file read; use it to range-read
-    // one region instead (see the README).
-    this.dirCell = new BigUint64Array(buf.slice(o, o + 8 * this.nRes0));
-    o += 8 * this.nRes0;
-    this.dirCoff = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
-    o += 4 * (this.nRes0 + 1);
-    // GOTCHA: this offset is not 8-byte aligned, so `new BigUint64Array(buf, o, n)`
-    // throws "start offset of BigUint64Array should be a multiple of 8".
-    // slice() copies into a fresh, aligned buffer -- 1.3 MB, once per day.
-    this.cells = new BigUint64Array(buf.slice(o, o + 8 * this.nCells));
-    o += 8 * this.nCells;
-    this.goff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
-    o += 4 * (this.nCells + 1);
-    this.coff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
-    o += 4 * (this.nCells + 1);
-    this.bkt = u8.subarray(o, o + this.nGroups);
-    o += this.nGroups;
-    this.post = u8.subarray(o);
-    // No length table to expand: each group announces its own pair count, so a
-    // cell's slice of post[] is self-describing.
+    this.res     = u8[9];
+
+    if (this.version === 4) {
+      this.nBuckets = u8[10];
+      this.nCells   = dv.getUint32(12, true);
+      this.nLegs    = dv.getUint32(16, true);
+      this.nGroups  = dv.getUint32(20, true);
+      this.bucketDs = dv.getUint32(24, true);   // bucket WIDTH in deciseconds
+      this.nRes0    = dv.getUint32(28, true);
+      let o = 32;
+      // The res-0 directory. Skip it for a whole-file read; use it to
+      // range-read one region instead (see the README).
+      // GOTCHA: these offsets are not 8-byte aligned, so
+      // `new BigUint64Array(buf, o, n)` throws. slice() copies into a fresh,
+      // aligned buffer -- ~1.3 MB, once per day.
+      this.dirCell = new BigUint64Array(buf.slice(o, o + 8 * this.nRes0));
+      o += 8 * this.nRes0;
+      this.dirCoff = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
+      o += 4 * (this.nRes0 + 1);
+      this.cells = new BigUint64Array(buf.slice(o, o + 8 * this.nCells));
+      o += 8 * this.nCells;
+      this.goff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
+      o += 4 * (this.nCells + 1);
+      this.coff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
+      o += 4 * (this.nCells + 1);
+      this.bkt = u8.subarray(o, o + this.nGroups);
+      o += this.nGroups;
+      this.post = u8.subarray(o);
+
+    } else if (this.version === 1) {
+      // Retained days built before the index gained a time dimension. One
+      // posting list per cell, no buckets, no per-group counts, no directory.
+      this.nCells   = dv.getUint32(12, true);
+      this.nLegs    = dv.getUint32(16, true);
+      this.nBuckets = 1;
+      this.nGroups  = this.nCells;
+      this.bucketDs = 864000;                   // the whole day, one bucket
+      this.nRes0    = 0;
+      let o = 20;
+      this.cells = new BigUint64Array(buf.slice(o, o + 8 * this.nCells));
+      o += 8 * this.nCells;
+      this.coff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
+      o += 4 * (this.nCells + 1);
+      this.post = u8.subarray(o);
+
+    } else {
+      throw new Error(`cells.bin v${this.version}: reader handles 1 and 4`);
+    }
+    // Whether get() can honour a time window at all. FALSE on v1 days -- the
+    // caller must fall back to the leg-span prune and accept 4-24x over-report,
+    // or refine with the geometry pass.
+    this.timeIndexed = this.version >= 2;
   }
 
   _cellIndex(cellHex) {
@@ -200,33 +233,50 @@ export class CellIndex {
     return -1;
   }
 
+  // `* 2**sh` not `<< sh`: shifts are 32-bit in JS.
+  _varint(i) {
+    let x = 0, sh = 0, b;
+    do { b = this.post[i++]; x += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+    return [x, i];
+  }
+
   /** lids in `cellHex` during [ds0, ds1] deciseconds from t_epoch.
-   *  Omit ds0/ds1 for the whole day. Clamp exactly as the builder does, or an
-   *  out-of-day query silently drops the edge buckets. */
+   *  Omit ds0/ds1 for the whole day. On a v1 day the window is IGNORED --
+   *  check `timeIndexed` so you know which you got. Clamp exactly as the
+   *  builder does, or an out-of-day query silently drops the edge buckets. */
   get(cellHex, ds0, ds1) {
     const at = this._cellIndex(cellHex);
     if (at < 0) return [];                     // no traffic in that cell, ever
+    const out = new Set();
+    let i = this.coff[at];
+    const end = this.coff[at + 1];
+
+    if (this.version === 1) {                  // one flat gap-coded list
+      let cur = 0;
+      while (i < end) {
+        let x; [x, i] = this._varint(i);
+        cur += x;
+        out.add(cur);
+      }
+      return [...out].sort((x, y) => x - y);
+    }
+
     const clamp = d => Math.min(this.nBuckets - 1,
                                 Math.max(0, Math.floor(d / this.bucketDs)));
     const b0 = ds0 === undefined ? 0 : clamp(ds0);
     const b1 = ds1 === undefined ? this.nBuckets - 1 : clamp(ds1);
-    const out = new Set();
-    let i = this.coff[at];                     // walk this cell's own range
     for (let g = this.goff[at]; g < this.goff[at + 1]; g++) {
-      let n = 0, sh = 0, b;
-      // `* 2**sh` not `<< sh`: shifts are 32-bit in JS.
-      do { b = this.post[i++]; n += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+      let n; [n, i] = this._varint(i);         // each group states its own size
       const want = this.bkt[g] >= b0 && this.bkt[g] <= b1;
       let cur = 0;
       for (let k = 0; k < n; k++) {
-        let x = 0, s2 = 0, c;
-        do { c = this.post[i++]; x += (c & 0x7f) * 2 ** s2; s2 += 7; } while (c & 0x80);
+        let x; [x, i] = this._varint(i);
         cur += x;                              // gap-coded, ascending
         if (want) out.add(cur);
       }
     }
-    if (i !== this.coff[at + 1])
-      throw new Error(`cells.bin: cell ${at} groups end at ${i}, coff says ${this.coff[at + 1]}`);
+    if (i !== end)
+      throw new Error(`cells.bin: cell ${at} groups end at ${i}, coff says ${end}`);
     return [...out].sort((x, y) => x - y);
   }
 }
@@ -273,9 +323,14 @@ export function decodeTrack(buf) {       // Uint8Array of exactly one record
 ```js
 /** Legs present in `cellHex` at some point inside [startMs, endMs).
  *  `exact` = false (default) answers from resident data with no requests. */
-export async function planesInCell(day, cellHex, startMs, endMs, exact = false) {
+export async function planesInCell(day, cellHex, startMs, endMs,
+                                   exact = !day.idx.timeIndexed) {
   const { meta, legs, idx, tracks } = day;
   const res = meta.index_res;
+  // `exact` defaults to TRUE on a day whose index has no time dimension: there
+  // the cheap answer IS the 4-24x over-report, and only the geometry pass
+  // narrows it. On a time-indexed day it defaults to false, because the hour
+  // buckets already did that work.
 
   // the index holds ONE resolution; bring the caller's cell to it
   const cellRes = h3.getResolution(cellHex);
@@ -285,8 +340,10 @@ export async function planesInCell(day, cellHex, startMs, endMs, exact = false) 
   const w0 = Math.round((startMs - meta.t_epoch * 1000) / 100);   // -> ds
   const w1 = Math.round((endMs   - meta.t_epoch * 1000) / 100);
 
-  // 1 + 2: zero requests. The index is already time-filtered to the hour, so
-  // the leg-span test only trims the residue inside the edge buckets.
+  // 1 + 2: zero requests. On a time-indexed day the index has already filtered
+  // to the hour and the leg-span test only trims the residue inside the edge
+  // buckets. On a v1 day get() IGNORES the window, so this prune is the only
+  // time filter there -- which is what the `exact` default above compensates.
   const cand = new Set();
   for (const k of keys) for (const l of idx.get(k, w0, w1)) cand.add(l);
   const maybe = [...cand].filter(l => legs.t0[l] <= w1 && legs.t1[l] >= w0);
@@ -296,7 +353,7 @@ export async function planesInCell(day, cellHex, startMs, endMs, exact = false) 
   // sub-hour entry/exit times. `exact: false` below skips stage 3 entirely.
   if (!exact) return maybe.map(l => ({
     lid: l, icao: legs.icao[l], reg: legs.reg[l], type: legs.type[l],
-    dep: legs.dep[l], arr: legs.arr[l],
+    dep: legs.dep[l], arr: legs.arr[l], flight: legs.flight[l],
   }));
 
   // 3 (optional): range-read the survivors and test the geometry against the
@@ -434,13 +491,13 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
    (land p90 is 55–116 km). If you need this properly, ask for the flag to be
    plumbed through.
 
-6. **There is no callsign in the deployed data.** I checked the live files:
-   `legs.parquet` has `icao, reg, type, dep, arr` and `flights.parquet` has no
-   `flight` column either. The README's bundle section claims "callsign, route,
-   times, bbox, all local" — **that line is wrong** on this branch;
-   `fit_spline.py` here emits no `callsigns.parquet` at all. Label aircraft by
-   `reg` (tail) or `type`, falling back to the `icao` hex, and do not build UI
-   that needs a flight number until the pipeline provides one.
+6. **The callsign is nullable, and absent from older days.** `legs.parquet`
+   carries `flight` alongside `icao`, `reg` and `type`, but readsb reports the
+   callsign only when it *changes*, so a leg never seen carrying one reads NULL.
+   Days built before the column existed have no `flight` field at all — the
+   loader above reads `r.flight ?? null` for exactly that reason. Label by
+   `flight` when present and fall back to `reg` (tail), then the `icao` hex;
+   never assume a flight number exists.
 
 Two smaller ones: `dep`/`arr` can be `null` (aircraft never seen on the ground)
 and can be **non-ICAO identifiers** from `airports.csv` such as `BE-0065` —
@@ -473,6 +530,38 @@ and it now asserts it for time as well as space. Two consequences worth knowing:
   its own timestamp left holes hours wide. So a leg may be listed for an hour in
   which it was only near the cell, by up to one sample interval. That is a false
   positive by design; refine with stage 3 if it matters.
+
+## Version transition
+
+What a v1 day cannot do, and what the reader does about it:
+
+| | v1 (retained days) | v4 (new days) |
+|---|---|---|
+| `idx.timeIndexed` | `false` | `true` |
+| `get(cell, ds0, ds1)` | window **ignored**, returns the whole day | honours the window to the hour |
+| Brussels cell, 12:00–12:15 | 1,286 legs | **109 legs** |
+| res-0 directory | absent (`nRes0 === 0`) | 120 entries, range-readable |
+| cost of one cell click | whole file | ~2.4 KB |
+| `flight` in `legs.parquet` | column absent | present, nullable |
+| `index_version` in `meta.json` | absent | `4` |
+
+Both numbers above are measured on the same data — the published v1 index for
+2026-09-20 and a v4 rebuild of the same day — and both readers agree with
+`verify_bundle.py`'s reference decoder on every query tried.
+
+Practical consequences:
+
+- **Take the version from `cells.bin`'s header, not `meta.json`.** The manifest
+  only gained `index_version` at v4, so on a retained day the key is missing
+  rather than `1`.
+- **`planesInCell` defaults `exact` to `!timeIndexed`.** On a v1 day it goes
+  straight to the geometry pass, because the cheap answer there is the 4–24×
+  over-report. Left alone, the same call gives a correct answer on both.
+- **Do not cache a decoded index across days** without keying the cache by
+  version; a v1 and a v4 index of the same date are different objects.
+- **If you would rather not carry two paths**, the alternative is to wait until
+  every v1 day has aged out of the retention window and then delete the v1
+  branch of the reader. Nothing else in the file depends on it.
 
 ## Quick reference
 
