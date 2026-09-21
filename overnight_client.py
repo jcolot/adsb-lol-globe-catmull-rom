@@ -38,23 +38,37 @@ FILES = ("airports_utc.parquet", "overnight_meta.json", "overnight.parquet")
 
 class OvernightClient:
     def __init__(self, airports, meta, table=None):
-        self.apt = airports     # ident -> (lat_e5, lon_e5, off_d0, off_dm1, off_dm2)
+        self.apt = airports     # ident -> (lat_e5, lon_e5, (off per tz_date))
         self.meta = meta
         self.table = table or {}
         self.d0 = dt.date.fromisoformat(meta["date"])
+        # date -> column position, straight from the meta. The table used to be
+        # exactly three columns around d0 and the lookup was arithmetic on k;
+        # it is now as wide as the copy you fetched (a per-date partition still
+        # ships D+1..D-2, the root copy spans the retention window), so the
+        # dates come from the file rather than from an assumption about it.
+        self.tz_at = {d: i for i, d in enumerate(meta["tz_dates"])}
 
     # -- loading -----------------------------------------------------------
     @staticmethod
     def _read(dirpath):
-        ap = pq.read_table(os.path.join(dirpath, "airports_utc.parquet")).to_pydict()
-        airports = {
-            ident: (lat, lon, d0, d1, d2)
-            for ident, lat, lon, d0, d1, d2 in zip(
-                ap["ident"], ap["lat"], ap["lon"],
-                ap["off_d0"], ap["off_dm1"], ap["off_dm2"])
-        }
         with open(os.path.join(dirpath, "overnight_meta.json")) as f:
             meta = json.load(f)
+        ap = pq.read_table(os.path.join(dirpath, "airports_utc.parquet")).to_pydict()
+        # partitions written before the table was widened have neither key --
+        # they are exactly the old three columns, so reconstruct what they meant
+        if not meta.get("tz_columns"):
+            meta["tz_columns"] = ["off_d0", "off_dm1", "off_dm2"]
+        if not meta.get("tz_dates"):
+            d0 = dt.date.fromisoformat(meta["date"])
+            meta["tz_dates"] = [(d0 - dt.timedelta(days=k)).isoformat()
+                                for k in range(len(meta["tz_columns"]))]
+        offs = [ap[c] for c in meta["tz_columns"]]
+        airports = {
+            ident: (lat, lon, tuple(col[i] for col in offs))
+            for i, (ident, lat, lon) in enumerate(
+                zip(ap["ident"], ap["lat"], ap["lon"]))
+        }
         table = {}
         tp = os.path.join(dirpath, "overnight.parquet")
         if os.path.exists(tp):
@@ -93,21 +107,24 @@ class OvernightClient:
     def off_min(self, ident, target: dt.date):
         """UTC offset in minutes for `ident` on `target`.
 
-        The partition carries only d0, d0-1 and d0-2. That is exactly enough
-        when the partition IS the arrival date: a departure is at most two days
-        earlier (a westbound date-line crossing is +2). Asking outside the
-        window means the wrong partition was fetched, so it raises rather than
-        silently returning a neighbouring day's offset.
+        A per-date partition carries D+1, D, D-1 and D-2. That is exactly
+        enough when the partition IS the arrival date: a departure is at most
+        two days earlier (a westbound date-line crossing is +2), and D+1 closes
+        a local day that runs past 00:00Z. Asking outside whatever window the
+        fetched copy covers means the wrong copy was fetched, so it raises
+        rather than silently returning a neighbouring day's offset. The root
+        copy spans the retained archive; fetch that one for an arbitrary date.
         """
         rec = self.apt.get(ident)
         if rec is None:
             raise KeyError(f"{ident} not in airports_utc.parquet")
-        k = (self.d0 - target).days
-        if not 0 <= k <= 2:
+        i = self.tz_at.get(target.isoformat())
+        if i is None:
             raise ValueError(
-                f"{target} is outside the 3-day window of the {self.d0} "
-                f"partition (k={k}) -- fetch date={target} instead")
-        return rec[2 + k]
+                f"{target} is outside this table ({self.meta['tz_dates'][-1]} "
+                f"..{self.meta['tz_dates'][0]}) -- fetch the root "
+                f"airports_utc.parquet, or date={target}")
+        return rec[2][i]
 
     def gc_km(self, dep, arr):
         a, b = self.apt[dep], self.apt[arr]
