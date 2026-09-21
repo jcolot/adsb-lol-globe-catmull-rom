@@ -90,6 +90,11 @@ class CellIndex:
     """cells.bin reader. The whole file is resident, so a lookup is a binary
     search over cell[] and a slice of post[].
 
+    v4 made every group state its own pair count, so a cell's byte range from
+    coff[] is self-describing: no length table, and nothing belonging to another
+    cell has to be decoded to reach yours. v3's varint length table was readable
+    but not indexable, which cost 43.8 KB of skipped lengths per cell click.
+
     v3 added a res-0 directory: every res-0 cell's descendants are ONE contiguous
     run of cell[], so a client can binary-search dir_cell[] and range-read just
     the slice covering its viewport instead of the whole file.
@@ -122,8 +127,8 @@ class CellIndex:
             o += 4 * (self.n_cells + 1)
             self.coff = self.poff[:-1] + [self.poff[-1]]
             self.n_res0 = 0
-            self.dir_cell, self.dir_coff, self.dir_glen = [], [0], [0]
-        elif self.version == 3:
+            self.dir_cell, self.dir_coff = [], [0]
+        elif self.version == 4:
             self.res, self.n_buckets, _, self.n_cells, self.n_legs, \
                 self.n_groups, self.bucket_ds, self.n_res0 = \
                 struct.unpack_from("<BBBIIIII", blob, 9)
@@ -134,8 +139,6 @@ class CellIndex:
             o += 8 * self.n_res0
             self.dir_coff = list(struct.unpack_from(f"<{self.n_res0 + 1}I", blob, o))
             o += 4 * (self.n_res0 + 1)
-            self.dir_glen = list(struct.unpack_from(f"<{self.n_res0 + 1}I", blob, o))
-            o += 4 * (self.n_res0 + 1)
             self.cells = list(struct.unpack_from(f"<{self.n_cells}Q", blob, o))
             o += 8 * self.n_cells
             self.goff = list(struct.unpack_from(f"<{self.n_cells + 1}I", blob, o))
@@ -144,42 +147,14 @@ class CellIndex:
             o += 4 * (self.n_cells + 1)
             self.bkt = list(struct.unpack_from(f"<{self.n_groups}B", blob, o))
             o += self.n_groups
-            # per-group posting LENGTHS as varints; rebuild the flat prefix
-            # offsets the old format stored outright. Each cell restarts from
-            # its own coff[], so a corrupt length cannot walk off into the
-            # next cell's postings unnoticed -- the structure check below
-            # compares the two.
-            glen_base = o
-            glen = []
-            for _g in range(self.n_groups):
-                v, o = read_varint(blob, o)
-                glen.append(v)
-            self.glen_off = glen_base      # where glen[] starts, for the dir check
-            base = o
-            self.poff = [0] * (self.n_groups + 1)
-            for i in range(self.n_cells):
-                pos = self.coff[i]
-                for g in range(self.goff[i], self.goff[i + 1]):
-                    self.poff[g] = pos
-                    pos += glen[g]
-                self.poff[self.goff[i + 1]] = pos
-            o = base
+            # No length table. Every group states its own pair count, so a
+            # cell's byte range from coff[] is self-describing and nothing has
+            # to be decoded ahead of it.
+            self.poff = None
         else:
             raise ValueError(f"cells.bin version {self.version} not supported")
         self.post = blob[o:]
         self.post_blob = blob
-
-    def _glen_byte_of(self, group):
-        """Byte offset of `group`'s length varint inside glen[]. Only the
-        verifier needs this -- a client reaches its groups through the res-0
-        directory instead of walking from zero."""
-        if not hasattr(self, "_glen_cum"):
-            cum, o = [0], self.glen_off
-            for _g in range(self.n_groups):
-                _v, o = read_varint(self.post_blob, o)
-                cum.append(o - self.glen_off)
-            self._glen_cum = cum
-        return self._glen_cum[group]
 
     def _find(self, cell):
         lo, hi = 0, self.n_cells - 1
@@ -193,7 +168,29 @@ class CellIndex:
                 hi = mid - 1
         return -1
 
-    def _decode(self, g):
+    def _groups_of(self, at):
+        """[(bucket, lids)] for cell index `at`, decoded from its own slice.
+
+        This is the whole point of v4: start at coff[at] and walk. Each group
+        announces its pair count, so the groups inside a cell are found without
+        a side table and without decoding anything that belongs to another cell.
+        """
+        i = self.coff[at]
+        end = self.coff[at + 1]
+        out = []
+        for g in range(self.goff[at], self.goff[at + 1]):
+            n, i = read_varint(self.post, i)
+            lids, cur = [], 0
+            for _k in range(n):
+                gap, i = read_varint(self.post, i)
+                cur += gap
+                lids.append(cur)
+            out.append((self.bkt[g], lids))
+        if i != end:
+            raise ValueError(f"cell {at}: groups end at {i}, coff says {end}")
+        return out
+
+    def _decode_v1(self, g):
         i, end = self.poff[g], self.poff[g + 1]
         out, cur = [], 0
         while i < end:
@@ -213,27 +210,28 @@ class CellIndex:
         at = self._find(cell)
         if at < 0:
             return []
-        g0, g1 = self.goff[at], self.goff[at + 1]
+        groups = self.buckets_of_at(at)
         if ds0 is None:
-            out = set()
-            for g in range(g0, g1):
-                out.update(self._decode(g))
-            return sorted(out)
-        b0 = min(self.n_buckets - 1, max(0, int(ds0 // self.bucket_ds)))
-        b1 = min(self.n_buckets - 1, max(0, int(ds1 // self.bucket_ds)))
+            b0, b1 = 0, self.n_buckets - 1
+        else:
+            b0 = min(self.n_buckets - 1, max(0, int(ds0 // self.bucket_ds)))
+            b1 = min(self.n_buckets - 1, max(0, int(ds1 // self.bucket_ds)))
         out = set()
-        for g in range(g0, g1):
-            if b0 <= self.bkt[g] <= b1:
-                out.update(self._decode(g))
+        for b, lids in groups:
+            if b0 <= b <= b1:
+                out.update(lids)
         return sorted(out)
+
+    def buckets_of_at(self, at):
+        if self.version >= 4:
+            return self._groups_of(at)
+        return [(self.bkt[g], self._decode_v1(g))
+                for g in range(self.goff[at], self.goff[at + 1])]
 
     def buckets_of(self, cell):
         """(bucket, lids) for each time bucket this cell saw traffic in."""
         at = self._find(cell)
-        if at < 0:
-            return []
-        return [(self.bkt[g], self._decode(g))
-                for g in range(self.goff[at], self.goff[at + 1])]
+        return [] if at < 0 else self.buckets_of_at(at)
 
     def query(self, cells, ds0=None, ds1=None):
         s = set()
@@ -323,16 +321,31 @@ def main():
               and all(idx.bkt[g] < idx.bkt[g + 1] for g in
                       range(idx.goff[i], idx.goff[i + 1] - 1))
               for i in range(idx.n_cells)))
-    check("posting offsets monotonic and cover post[]",
-          all(idx.poff[i] <= idx.poff[i + 1] for i in range(len(idx.poff) - 1))
-          and idx.poff[-1] == len(idx.post),
-          f"{idx.poff[-1]} vs {len(idx.post)}")
-    check("per-cell posting base agrees with its first group's offset",
-          all(idx.coff[i] == idx.poff[idx.goff[i]] for i in range(idx.n_cells)))
-    check("every posting list is non-empty and ascending",
-          all(len(p) > 0 and all(p[k] < p[k + 1] for k in range(len(p) - 1))
-              and p[-1] < idx.n_legs
-              for p in (idx._decode(g) for g in range(idx.n_groups))))
+    check("per-cell offsets monotonic and tile post[] exactly",
+          all(idx.coff[i] <= idx.coff[i + 1] for i in range(len(idx.coff) - 1))
+          and idx.coff[0] == 0 and idx.coff[-1] == len(idx.post),
+          f"{idx.coff[-1]} vs {len(idx.post)}")
+    # The v4 property: a cell's groups decode from its OWN byte range and land
+    # exactly on its end. _groups_of raises if they do not, so this walks every
+    # cell rather than sampling -- it is the check that the self-delimiting
+    # encoding is actually self-consistent.
+    bad_walk = bad_list = 0
+    for i in range(idx.n_cells):
+        try:
+            gs = idx.buckets_of_at(i)
+        except ValueError:
+            bad_walk += 1
+            continue
+        if len(gs) != idx.goff[i + 1] - idx.goff[i]:
+            bad_walk += 1
+        for _b, lids in gs:
+            if (not lids or lids[-1] >= idx.n_legs
+                    or any(lids[k] >= lids[k + 1] for k in range(len(lids) - 1))):
+                bad_list += 1
+    check("every cell's groups decode from its own range and end on it",
+          bad_walk == 0, f"{bad_walk} cells")
+    check("every posting list is non-empty, ascending and in range",
+          bad_list == 0, f"{bad_list} lists")
     # ---- the res-0 directory -------------------------------------------
     # This is load-bearing: a client binary-searches it and slices, so a wrong
     # offset does not crash, it silently returns a subset of a region's traffic.
@@ -359,16 +372,6 @@ def main():
                 bad += 1
         check(f"each cell falls in its own res-0 run ({len(probe)} sampled)",
               bad == 0, f"{bad} misplaced")
-        # glen offsets must land exactly on the partition's first group
-        gl = idx.glen_off
-        bad_g = 0
-        for k in range(idx.n_res0):
-            want = idx.goff[idx.dir_coff[k]]
-            pos, g = gl + idx.dir_glen[k], 0
-            # decode forward from byte 0 of glen[] only once, then compare
-            bad_g += 0 if idx.dir_glen[k] == idx._glen_byte_of(want) else 1
-        check("res-0 glen offsets point at the run's first group", bad_g == 0,
-              f"{bad_g} wrong")
 
     check("file sizes match meta",
           all(os.path.getsize(os.path.join(a.bundle, v["path"])) == v["bytes"]

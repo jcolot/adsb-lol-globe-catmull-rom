@@ -55,7 +55,7 @@ def _arrow(rel):
 
 
 MAGIC = b"ADSBIDX1"
-IDX_VERSION = 3                 # 2 added time buckets, 3 the res-0 directory
+IDX_VERSION = 4                 # 2 time buckets, 3 res-0 dir, 4 self-delimiting groups
 Q_POS = 1e5                     # points_legs lat/lon are degrees * 1e5
 DAY_DS = 86400 * 10             # deciseconds in a day -- the bucketing domain
 
@@ -449,26 +449,39 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
     gap[gstarts] = lid[gstarts]
     if (gap < 0).any():
         raise ValueError("posting lists not ascending within a group")
-    post, nb = varint_encode(gap.astype(np.uint64))
+
+    # EACH GROUP STATES ITS OWN LENGTH, as a varint pair count in front of its
+    # gaps. The obvious alternative -- a side table of byte lengths, which is
+    # what v3 had -- is a varint stream, and a varint stream is readable but not
+    # INDEXABLE: entry g does not sit at 4*g, so reaching it means decoding
+    # every entry before it. Measured on 2026-09-20, answering one click on the
+    # Brussels cell walked 43,833 bytes of lengths belonging to other cells to
+    # reach the 33 bytes it wanted, a 1359x waste. Self-delimiting groups make
+    # coff[j] the only thing a client needs: the cell's byte range in post[] is
+    # then fully self-describing. It is free -- a pair count and a byte length
+    # are both ~1 byte per group, so post[] grows by what glen[] gave up.
+    n_g = len(gstarts)
+    # int64: np.repeat below will not take uint64 repeat counts
+    counts = np.diff(np.concatenate((gstarts, [len(lid)]))).astype(np.int64)
+    # one encode for the whole payload: slot each count in front of its group's
+    # gaps, so group g's block starts at value index gstarts[g] + g
+    vals = np.empty(len(lid) + n_g, dtype=np.uint64)
+    gblock = gstarts + np.arange(n_g)
+    vals[gblock] = counts.astype(np.uint64)
+    vals[np.arange(len(lid)) + np.repeat(np.arange(n_g), counts) + 1] = \
+        gap.astype(np.uint64)
+    post, nb = varint_encode(vals)
 
     nb_cum = np.concatenate(([0], np.cumsum(nb)))
-    poff = nb_cum[np.concatenate((gstarts, [len(lid)]))].astype(np.uint32)
-    if int(poff[-1]) != len(post):
-        raise ValueError("posting offsets disagree with buffer length")
-    if int(goff[-1]) != len(gstarts):
+    if int(goff[-1]) != n_g:
         raise ValueError("group offsets disagree with the group count")
 
-    # Groups are small -- a few pairs, ~9 bytes of postings each -- so a uint32
-    # prefix offset PER GROUP is the single most expensive thing in the file: at
-    # hourly granularity that table alone was 4.5 MB of a 17.7 MB index, more
-    # than a third of it, to describe 10 MB of payload. Ship a uint32 byte
-    # offset per CELL plus a varint length per group instead, and let the reader
-    # prefix-sum the lengths it needs. Costs ~1.8 MB in place of 4.5 MB; the
-    # reader may expand the lengths back to a flat array in memory, which is the
-    # point -- the wire is the scarce side, not the heap.
-    glen = np.diff(poff.astype(np.int64)).astype(np.uint64)
-    glen_buf, glen_nb = varint_encode(glen)
-    coff = poff[goff]           # byte offset of each cell's FIRST group
+    # One uint32 byte offset per CELL into post[]. A uint32 per GROUP would be
+    # directly indexable too but cost 4.55 MB against this 0.64 MB, and per-cell
+    # is the granularity a client actually asks at: it clicks a cell, then reads
+    # that cell's whole byte range and walks the self-delimiting groups inside.
+    coff = np.concatenate(
+        (nb_cum[gblock[goff[:-1].astype(np.int64)]], [len(post)])).astype(np.uint32)
 
     # ---- res-0 directory -------------------------------------------------
     # Cells are sorted by H3 index, so every res-0 cell's descendants form ONE
@@ -481,10 +494,6 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
     # divide with no overlap -- unlike a split by hour, which duplicates the
     # cell table and inflated 1.58x when measured.
     #
-    # dir_glen_off is the part that makes this usable rather than decorative:
-    # glen[] is a varint STREAM, so without a per-partition byte offset a
-    # client would have to decode every length from the start of the file to
-    # locate its own groups, which defeats the point of the directory.
     con.register("ucell_t", pa.table({"i": np.arange(len(ucell), dtype=np.int64),
                                       "cell": ucell}))
     p0 = _arrow(con.execute(
@@ -501,10 +510,6 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
     if not (dir_cell[1:] > dir_cell[:-1]).all():
         raise ValueError("res-0 parents are not ascending in cell[] order")
     dir_coff = np.concatenate((r_start, [len(ucell)])).astype(np.uint32)
-    glen_cum = np.concatenate(([0], np.cumsum(glen_nb))).astype(np.int64)
-    dir_glen = np.concatenate(
-        (glen_cum[goff[dir_coff[:-1]].astype(np.int64)], [len(glen_buf)])
-    ).astype(np.uint32)
 
     n_legs = con.execute("SELECT count(*) FROM leg").fetchone()[0]
     with open(path, "wb") as f:
@@ -516,21 +521,20 @@ def write_cells(con, points, path, index_res, step_km, buckets, has_cusp,
                             len(dir_cell)))
         f.write(dir_cell.astype("<u8").tobytes())
         f.write(dir_coff.astype("<u4").tobytes())
-        f.write(dir_glen.astype("<u4").tobytes())
         f.write(ucell.astype("<u8").tobytes())
         f.write(goff.astype("<u4").tobytes())
         f.write(coff.astype("<u4").tobytes())
         f.write(gbkt.astype("<u1").tobytes())
-        f.write(glen_buf.tobytes())
         f.write(post.tobytes())
     sz = os.path.getsize(path)
     log(f"cells.bin: {sz/1e6:.2f} MB, {len(ucell)} cells, {len(gstarts)} groups "
         f"({len(gstarts)/len(ucell):.2f}/cell), {len(lid)} pairs, "
         f"{len(post)/len(lid):.2f} B/pair "
-        f"(post {len(post)/1e6:.2f} MB, cells {8*len(ucell)/1e6:.2f}, "
-        f"group tables {(8*len(ucell)+len(gbkt)+len(glen_buf))/1e6:.2f}, "
+        f"(post {len(post)/1e6:.2f} MB incl. per-group counts, "
+        f"cells {8*len(ucell)/1e6:.2f}, "
+        f"offsets {(8*len(ucell)+len(gbkt))/1e6:.2f}, "
         f"res-0 dir {len(dir_cell)} entries / "
-        f"{(8*len(dir_cell)+8*(len(dir_cell)+1))/1024:.1f} KB)")
+        f"{(8*len(dir_cell)+4*(len(dir_cell)+1))/1024:.1f} KB)")
     return len(ucell), len(lid), len(gstarts), n_buckets, len(dir_cell)
 
 

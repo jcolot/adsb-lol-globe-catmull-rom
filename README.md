@@ -614,7 +614,7 @@ date). This matters: `nodes.parquet` stores `t` relative to each *aircraft's*
 ```
 offset   size               field
 0        8                  magic "ADSBIDX1"
-8        1                  version    3
+8        1                  version    4
 9        1                  res        H3 resolution (default 4)
 10       1                  n_buckets  time buckets, DERIVED from the span
 11       1                  — padding —
@@ -625,15 +625,12 @@ offset   size               field
 28       4                  n_res0     uint32, res-0 cells with traffic
 32       8 x n_res0         dir_cell[] uint64, ascending res-0 H3 index
 …        4 x (n_res0+1)     dir_coff[] uint32 prefix index into cell[]
-…        4 x (n_res0+1)     dir_glen[] uint32 prefix BYTE offset into glen[]
 …        8 x n_cells        cell[]     uint64, ascending H3 index
-…        4 x (n_cells+1)    goff[]     uint32 prefix offsets into bucket[]/glen[]
-…        4 x (n_cells+1)    coff[]     uint32 byte offset in post[] of the
-                                       cell's FIRST group
+…        4 x (n_cells+1)    goff[]     uint32 prefix offsets into bucket[]
+…        4 x (n_cells+1)    coff[]     uint32 prefix BYTE offset into post[]
 …        1 x n_groups       bucket[]   uint8, ascending within a cell
-…        —                  glen[]     n_groups varints: each group's byte
-                                       length in post[]
-…        —                  post[]     per group: varint gap-coded ascending lids
+…        —                  post[]     per group: varint n_pairs, then n_pairs
+                                       gap-coded ascending lids
 ```
 
 A **group** is one `(cell, time bucket)`. Bucket *b* covers
@@ -678,10 +675,6 @@ hour cannot do that — it duplicates the cell table, and measured at 1.58×.
 Traffic is very unevenly spread, which helps here: largest partition 1.41 MB,
 median **14 KB**, top 3 res-0 cells holding 29% of all postings.
 
-`dir_glen[]` is what makes the directory usable rather than decorative. `glen[]`
-is a varint *stream*, so without a per-partition byte offset a client would have
-to decode every length from the start of the file to find its own groups.
-
 This is the same shape as PMTiles — one object, directory in the header,
 spatially clustered payload, HTTP range reads — but keyed by H3 rather than by
 Mercator tiles, because the two grids do not nest: a res-4 hexagon straddles
@@ -698,10 +691,30 @@ Cells stay sorted by H3 index because a parent's descendants form exactly **one*
 contiguous run in that order, so "everything under this cell" is a single slice
 and the client can pick its covering resolution by zoom.
 
-`glen[]` is varints rather than the flat `uint32` offset-per-group the first
-draft used, because at hourly granularity that table was 4.5 MB of a 17.7 MB
-index — more than a third of the file, to describe 10 MB of payload. A reader is
-free to expand it back into a flat array in memory; the wire is the scarce side.
+**Every group states its own length**, as a varint pair count in front of its
+gaps, so a cell's byte range from `coff[]` is entirely self-describing. A side
+table of lengths — which v3 had — is a varint *stream*: readable, but not
+indexable, because entry *g* does not sit at `4*g`. Reaching a cell's lengths
+meant decoding every length before it. Measured on 2026-09-20, one click on the
+Brussels cell walked **43,833 bytes** of lengths belonging to other cells to
+reach the **33 bytes** it wanted — a 1359× waste. A flat `uint32` per group
+would be indexable but costs 4.55 MB against that table's 1.14 MB.
+
+Folding the length into the payload is free: a pair count and a byte length are
+both ~1 byte per group, so `post[]` grows by exactly what the table gave up.
+Measured, v4 came out **1,268 bytes smaller** than v3 on the same day.
+
+What it buys, for the click-a-cell interaction:
+
+| | v3 | v4 |
+|---|---|---|
+| first click in a region | 85.5 KB | **22.5 KB** |
+| each further click | 44 KB | **2.4 KB** |
+
+`coff[]` is a byte offset per **cell**, not per group, for the same reason: a
+`uint32` per group would be 4.55 MB against 0.64 MB, and per-cell is the
+granularity a client asks at — it clicks a cell, reads that cell's range, and
+walks the self-delimiting groups inside.
 
 **Why the time dimension.** Without it a cell query can only be narrowed by each
 leg's `[t0, t1]`, and that span is the whole flight while its time inside one

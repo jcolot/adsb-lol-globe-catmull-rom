@@ -3,10 +3,11 @@
 For the frontend agent. Everything below is measured against the live bucket,
 data date **2026-09-20** (113,522 legs, 12.46 M nodes).
 
-> **Updated for `cells.bin` v3.** The index is keyed by `(cell, hour)`, not just
-> `(cell)`, which is what makes this query cheap, and it carries a **res-0
-> directory** so you can range-read one region instead of the whole file. Read
-> **The header moved** below before porting an older reader.
+> **Updated for `cells.bin` v4.** The index is keyed by `(cell, hour)`, not just
+> `(cell)`, which is what makes this query cheap; it carries a **res-0 directory**
+> so you can range-read one region instead of the whole file; and each group
+> states its own length, so **one cell click costs ~2.4 KB**. Read **The header
+> moved** below before porting an older reader.
 
 ## The one-paragraph answer
 
@@ -130,16 +131,19 @@ export async function loadDay(date) {
 
 ### `cells.bin` reader
 
-**The header moved, twice.** v2 added `n_buckets`, `n_groups` and `bucket_ds`;
-v3 added `n_res0` plus a res-0 directory, so the header is 32 bytes and the
-directory sits between it and `cell[]`. An old reader pointed at a v3 file
-returns plausible garbage rather than failing loudly, so check `version` first.
+**The header moved.** v2 added `n_buckets`, `n_groups` and `bucket_ds`; v3 added
+`n_res0` plus a res-0 directory, so the header is 32 bytes and the directory sits
+between it and `cell[]`; v4 dropped the length table. An old reader pointed at a
+v4 file returns plausible garbage rather than failing loudly, so check `version`
+first.
 
 The reader below loads the file whole, which is the simple path and what you
-should start with. If a regional view makes 15 MB per day too much, the same
-directory lets you range-read one res-0 cell instead: measured at **1.38 MB in
-7 range requests, 9.2% of the file**, with answers identical to the whole-file
-reader. See the res-0 directory section in the README for the byte layout.
+should start with. For the click-a-cell interaction you do not have to: `coff[]`
+gives each cell's byte range in `post[]` and every group inside announces its own
+pair count, so a click needs `goff[j..j+1]`, `coff[j..j+1]`, its `bucket[]` bytes
+and its postings — measured at **22.5 KB for the first click in a region and
+2.4 KB for each one after**, against a 15.34 MB file. The res-0 directory is how
+you find the region. See the README for the byte layout.
 
 **Do not assume 24 buckets.** The bucket *width* is fixed; the *count* follows
 the data span. A single UTC day gives 24 hourly buckets, but a bundle stitched
@@ -153,8 +157,8 @@ export class CellIndex {
     if (new TextDecoder().decode(u8.subarray(0, 8)) !== 'ADSBIDX1')
       throw new Error('cells.bin: bad magic');
     this.version = u8[8];
-    if (this.version !== 3)
-      throw new Error(`cells.bin v${this.version}: this reader wants v3`);
+    if (this.version !== 4)
+      throw new Error(`cells.bin v${this.version}: this reader wants v4`);
     this.res       = u8[9];
     this.nBuckets  = u8[10];
     this.nCells    = dv.getUint32(12, true);
@@ -162,19 +166,16 @@ export class CellIndex {
     this.nGroups   = dv.getUint32(20, true);
     this.bucketDs  = dv.getUint32(24, true);   // bucket WIDTH in deciseconds
     this.nRes0     = dv.getUint32(28, true);
-    // the res-0 directory: skip it for a whole-file read, use it to range-read
-    // one region (see the README). Kept here so the offsets below are right.
     let o = 32;
+    // The res-0 directory. Skip it for a whole-file read; use it to range-read
+    // one region instead (see the README).
     this.dirCell = new BigUint64Array(buf.slice(o, o + 8 * this.nRes0));
     o += 8 * this.nRes0;
     this.dirCoff = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
     o += 4 * (this.nRes0 + 1);
-    this.dirGlen = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
-    o += 4 * (this.nRes0 + 1);
     // GOTCHA: this offset is not 8-byte aligned, so `new BigUint64Array(buf, o, n)`
-    // throws "start offset of BigUint64Array should be a multiple of 8" unless
-    // the ArrayBuffer itself starts 8-aligned. slice() copies into a fresh,
-    // aligned buffer -- 1.3 MB, once per day. Do the same for safety.
+    // throws "start offset of BigUint64Array should be a multiple of 8".
+    // slice() copies into a fresh, aligned buffer -- 1.3 MB, once per day.
     this.cells = new BigUint64Array(buf.slice(o, o + 8 * this.nCells));
     o += 8 * this.nCells;
     this.goff = new Uint32Array(buf.slice(o, o + 4 * (this.nCells + 1)));
@@ -183,29 +184,9 @@ export class CellIndex {
     o += 4 * (this.nCells + 1);
     this.bkt = u8.subarray(o, o + this.nGroups);
     o += this.nGroups;
-    // Per-group posting LENGTHS, varint on the wire. Expand once into a flat
-    // prefix table: it costs 4 B/group in memory and saves 2.7 MB of download,
-    // which is the trade the format is making.
-    this.poff = new Uint32Array(this.nGroups + 1);
-    {
-      let i = o, g = 0;
-      const len = new Uint32Array(this.nGroups);
-      for (; g < this.nGroups; g++) {
-        let x = 0, sh = 0, b;
-        do { b = u8[i++]; x += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
-        len[g] = x;
-      }
-      o = i;                                   // post[] starts here
-      for (let c = 0; c < this.nCells; c++) {
-        let pos = this.coff[c];
-        for (let gg = this.goff[c]; gg < this.goff[c + 1]; gg++) {
-          this.poff[gg] = pos;
-          pos += len[gg];
-        }
-        this.poff[this.goff[c + 1]] = pos;
-      }
-    }
     this.post = u8.subarray(o);
+    // No length table to expand: each group announces its own pair count, so a
+    // cell's slice of post[] is self-describing.
   }
 
   _cellIndex(cellHex) {
@@ -219,35 +200,33 @@ export class CellIndex {
     return -1;
   }
 
-  _decode(g) {
-    const out = [];
-    let i = this.poff[g], cur = 0;
-    const end = this.poff[g + 1];
-    while (i < end) {
-      let x = 0, sh = 0, b;
-      // `* 2**sh` not `<< sh`: shifts are 32-bit in JS.
-      do { b = this.post[i++]; x += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
-      cur += x;                                // gap-coded, ascending
-      out.push(cur);
-    }
-    return out;
-  }
-
   /** lids in `cellHex` during [ds0, ds1] deciseconds from t_epoch.
    *  Omit ds0/ds1 for the whole day. Clamp exactly as the builder does, or an
    *  out-of-day query silently drops the edge buckets. */
   get(cellHex, ds0, ds1) {
     const at = this._cellIndex(cellHex);
     if (at < 0) return [];                     // no traffic in that cell, ever
-    const g0 = this.goff[at], g1 = this.goff[at + 1];
     const clamp = d => Math.min(this.nBuckets - 1,
                                 Math.max(0, Math.floor(d / this.bucketDs)));
     const b0 = ds0 === undefined ? 0 : clamp(ds0);
     const b1 = ds1 === undefined ? this.nBuckets - 1 : clamp(ds1);
     const out = new Set();
-    for (let g = g0; g < g1; g++)
-      if (this.bkt[g] >= b0 && this.bkt[g] <= b1)
-        for (const l of this._decode(g)) out.add(l);
+    let i = this.coff[at];                     // walk this cell's own range
+    for (let g = this.goff[at]; g < this.goff[at + 1]; g++) {
+      let n = 0, sh = 0, b;
+      // `* 2**sh` not `<< sh`: shifts are 32-bit in JS.
+      do { b = this.post[i++]; n += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+      const want = this.bkt[g] >= b0 && this.bkt[g] <= b1;
+      let cur = 0;
+      for (let k = 0; k < n; k++) {
+        let x = 0, s2 = 0, c;
+        do { c = this.post[i++]; x += (c & 0x7f) * 2 ** s2; s2 += 7; } while (c & 0x80);
+        cur += x;                              // gap-coded, ascending
+        if (want) out.add(cur);
+      }
+    }
+    if (i !== this.coff[at + 1])
+      throw new Error(`cells.bin: cell ${at} groups end at ${i}, coff says ${this.coff[at + 1]}`);
     return [...out].sort((x, y) => x - y);
   }
 }
