@@ -104,15 +104,16 @@ binary-searches the directory and range-reads only the region it is showing.
 
 Measured on 2026-09-20: **120 of the 122** res-0 cells carry traffic, the
 directory costs **1.9 KB** of a 15.34 MB index (0.012%), and reading the res-0
-cell containing Brussels takes **1.38 MB in 7 range requests — 9.2% of the
+cell containing Brussels takes **1,383 KiB in 7 range requests — 9.2% of the
 file** — returning answers identical to the whole-file reader on all 2,399 of
 its res-4 cells, all-day and for a 15-minute window.
 
 Partitioning this way costs **nothing**: every res-4 cell has exactly one res-0
 parent, so `cell[]`, `goff[]` and `coff[]` divide with no overlap. A split by
 hour cannot do that — it duplicates the cell table, and measured at 1.58×.
-Traffic is very unevenly spread, which helps here: largest partition 1.41 MB,
-median **14 KB**, top 3 res-0 cells holding 29% of all postings.
+Traffic is very unevenly spread, which helps here: largest partition 1.33 MB,
+median **18 KB**, top 3 res-0 cells holding 27% of all postings and the top 10
+holding 55%.
 
 This is the same shape as PMTiles — one object, directory in the header,
 spatially clustered payload, HTTP range reads — but keyed by H3 rather than by
