@@ -59,7 +59,14 @@ jobs:
     timeout-minutes: 60
     env:
       RCLONE_CONFIG_R2_TYPE: s3
-      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      # OVH Object Storage. rclone has no OVH provider entry, and "Other" is
+      # its generic S3 path -- "Cloudflare" here would keep R2's quirk
+      # handling (checksum and multipart behaviour) pointed at a bucket that
+      # does not have them. The region is not optional as it was on R2, which
+      # accepts "auto"; OVH wants the real one, and it must agree with the
+      # endpoint host.
+      RCLONE_CONFIG_R2_PROVIDER: Other
+      RCLONE_CONFIG_R2_REGION: eu-west-par
       RCLONE_CONFIG_R2_ACL: private
       RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
