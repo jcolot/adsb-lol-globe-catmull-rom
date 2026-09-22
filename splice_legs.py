@@ -33,8 +33,8 @@ both halves read as "<icao>_<k>" and the dates are implicit in the inputs.
 
 What the timestamps CANNOT do is confirm the match, which is why they are not
 used for it. Over the North Atlantic the median node gap at cruise is 2.7 h
-(README), so the last fix before midnight can sit hours short of it and the
-first fix after can be hours past. Two independent checks instead:
+(docs/overnight.md), so the last fix before midnight can sit hours short of
+it and the first fix after can be hours past. Two independent checks instead:
 
   --max-gap-h    the unobserved stretch across the boundary, default 3.0 h,
                  sized against that 2.7 h median rather than the cut itself;

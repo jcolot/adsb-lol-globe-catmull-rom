@@ -143,7 +143,7 @@ gives each cell's byte range in `post[]` and every group inside announces its ow
 pair count, so a click needs `goff[j..j+1]`, `coff[j..j+1]`, its `bucket[]` bytes
 and its postings — measured at **22.5 KB for the first click in a region and
 2.4 KB for each one after**, against a 15.34 MB file. The res-0 directory is how
-you find the region. See the README for the byte layout.
+you find the region. See [the bundle format](bundle-format.md) for the byte layout.
 
 **Do not assume 24 buckets.** The bucket *width* is fixed; the *count* follows
 the data span. A single UTC day gives 24 hourly buckets, but a bundle stitched
@@ -168,7 +168,7 @@ export class CellIndex {
     this.nRes0     = dv.getUint32(28, true);
     let o = 32;
     // The res-0 directory. Skip it for a whole-file read; use it to range-read
-    // one region instead (see the README).
+    // one region instead (see bundle-format.md).
     this.dirCell = new BigUint64Array(buf.slice(o, o + 8 * this.nRes0));
     o += 8 * this.nRes0;
     this.dirCoff = new Uint32Array(buf.slice(o, o + 4 * (this.nRes0 + 1)));
@@ -436,7 +436,7 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
 
 6. **There is no callsign in the deployed data.** I checked the live files:
    `legs.parquet` has `icao, reg, type, dep, arr` and `flights.parquet` has no
-   `flight` column either. The README's bundle section claims "callsign, route,
+   `flight` column either. The [bundle doc](bundle-format.md) claims "callsign, route,
    times, bbox, all local" — **that line is wrong** on this branch;
    `fit_spline.py` here emits no `callsigns.parquet` at all. Label aircraft by
    `reg` (tail) or `type`, falling back to the `icao` hex, and do not build UI

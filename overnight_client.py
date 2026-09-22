@@ -16,7 +16,7 @@ No zoneinfo, no tzdata, no timezonefinder: the UTC offsets in
 airports_utc.parquet are already resolved per date, which is the whole point of
 shipping them that way. The only arithmetic is integer minutes.
 
-Mirrors the JS decoder in the README line for line, including the two-pass
+Mirrors the JS decoder in docs/overnight.md line for line, including the two-pass
 departure offset and the 3-day window guard.
 
 Usage:
