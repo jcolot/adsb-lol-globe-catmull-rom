@@ -348,11 +348,9 @@ supersedes it at a third less size (measured on 2026-09-01: 161 MB vs ~106 MB fo
 the same 14.4 M nodes).
 
 `legs/airports/airport=<ICAO>/data_0.parquet` is **still built and uploaded, and
-should stay that way** — and it now carries each leg's `base_ts`, `t_off`,
-`t_on`, `dep_gnd` and `arr_gnd` alongside the points, so one request answers
-both "which flights" and "draw them" without the day-wide index. An earlier draft of this section claimed the bundle made
-it redundant; measuring the read pattern showed that's only half true, and the
-half it gets wrong is the expensive half.
+should stay that way**. It carries each leg's `base_ts`, `t_off`, `t_on`,
+`dep_gnd` and `arr_gnd` alongside the points, so one request answers both "which
+flights" and "draw them" without the day-wide index.
 
 The `(dep, t0)` sort puts every *departure* from one airport in a single byte
 range, so those cost one request. *Arrivals* into that airport are scattered —
