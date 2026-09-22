@@ -67,7 +67,19 @@ jobs:
       # endpoint host.
       RCLONE_CONFIG_R2_PROVIDER: Other
       RCLONE_CONFIG_R2_REGION: eu-west-par
-      RCLONE_CONFIG_R2_ACL: private
+      # public-read, not private: OVH grants anonymous access through ACLs and
+      # NOT bucket policies, which its docs list as "not yet available". On R2
+      # the public r2.dev domain made object ACLs irrelevant and private was
+      # harmless; here it is what the browser gets 403 on. Measured after the
+      # first successful OVH upload: every object returned 403 to an anonymous
+      # GET while the upload itself reported success -- the failure mode this
+      # avoids is a green pipeline and a broken site.
+      #
+      # Objects only. The BUCKET keeps its private ACL, because READ at bucket
+      # level means "list every object" and the frontend never lists -- that is
+      # what dates.json is for. Public objects without a public index is what
+      # the r2.dev URL gave us before.
+      RCLONE_CONFIG_R2_ACL: public-read
       RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
