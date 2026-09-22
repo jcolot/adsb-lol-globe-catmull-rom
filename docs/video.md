@@ -87,11 +87,11 @@ harder. Neither grid is area-uniform, and correcting for it is pointless in
 `anomaly` mode, where any time-constant per-pixel factor divides out — measured,
 the region percentages move by ≤0.5 pp and the shot list does not reorder.
 
-Counting whole traces instead of legs was this script's first version. It is
-wrong, but subtly: it changes only 16% of lit pixels, so the headline
-correlation barely moves (r 0.937 → 0.943). Those 16% are the ones that matter —
-median reference density 7.9 against 0.50 overall, undercounted by ~6 — i.e. the
-hubs and busy corridors, which is exactly where a frequency change shows up.
+**Count legs, not whole traces.** The difference hides well: it changes only 16%
+of lit pixels, so the headline correlation barely moves (r 0.937 → 0.943). Those
+16% are the ones that matter — median reference density 7.9 against 0.50
+overall, undercounted by ~6 — i.e. the hubs and busy corridors, which is exactly
+where a frequency change shows up.
 
 **Do not splice the two into one run.** A 5× step at the join renders as exactly
 the kind of jump this tool exists to distinguish from a real event. Every grid
@@ -139,14 +139,13 @@ there while being the binding constraint locally.
 
 **Render memory.** The stack is held whole, so a 245-day run at `--grid-zoom 2`
 is 3.8 GB, and `rolling_mean` and `trailing_baseline` each need a second array
-of the same shape: ~7.7 GB peak against a runner's 16 GB. Those two used to
-build a float64 cumulative sum over the whole stack — and because
-`np.concatenate` holds both its input and its result, that was 15.4 GB of
-float64 on top of the stack, or 23 GB total, which simply did not run. They now
-slide a running total instead, which is bit-identical and needs one
-`(side, side)` accumulator. If a longer span ever runs out of memory, build the
-grids at `--grid-zoom 1` (1024 px, a quarter of it) rather than trimming the
-render.
+of the same shape: ~7.7 GB peak against a runner's 16 GB. Both slide a running
+total over the stack, needing one `(side, side)` accumulator. Do not replace
+that with a float64 cumulative sum: it is bit-identical but, because
+`np.concatenate` holds its input and its result at once, costs 15.4 GB on top of
+the stack — 23 GB total, which does not run. If a longer span ever runs out of
+memory, build the grids at `--grid-zoom 1` (1024 px, a quarter of it) rather
+than trimming the render.
 
 ## Framing a region: aspect, palette, basemap
 

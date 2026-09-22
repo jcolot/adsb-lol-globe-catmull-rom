@@ -78,14 +78,13 @@ range reads over ~0.5–1.3 MiB, not a re-download.
 
 ## Stage 3 is per-*visit*, not per-leg min/max
 
-The first version of this measurement bracketed each leg's in-cell time as
-`min(t)…max(t)` over its in-cell samples, and got a median dwell of **250
-minutes** at EBBR. That number is an artifact: an aircraft parked at Brussels is
-in that cell at 04:00 and again at 16:00, so its min/max spans every window in
-between. Legs hit the same cell up to **26 separate times** on this day (median
-1). You must group in-cell samples into **contiguous runs** and test each run
-against the window. Using min/max instead inflated the EBBR 15-min answer from
-48 legs to 79.
+Bracketing each leg's in-cell time as `min(t)…max(t)` over its in-cell samples
+gives a median dwell of **250 minutes** at EBBR. That number is an artifact: an
+aircraft parked at Brussels is in that cell at 04:00 and again at 16:00, so its
+min/max spans every window in between. Legs hit the same cell up to **26
+separate times** on this day (median 1). You must group in-cell samples into
+**contiguous runs** and test each run against the window; min/max instead
+inflates the EBBR 15-min answer from 48 legs to 79.
 
 ## Code
 
@@ -405,11 +404,10 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
    and refine against the leg bbox and then the geometry. There are **never**
    false negatives — that is the property `verify_bundle.py` asserts.
 
-3. **A leg's span is not its dwell — but the index now knows that.** Filtering
-   on `t0`/`t1` alone over-reports 4–24×; that was the reason stage 3 used to be
-   mandatory. Pass the window to `idx.get()` and the hour buckets do the work.
-   Do *not* skip passing it and then filter on the leg span — you would be back
-   to the old over-report with a bigger file.
+3. **A leg's span is not its dwell — but the index knows that.** Filtering on
+   `t0`/`t1` alone over-reports 4–24×. Pass the window to `idx.get()` and the
+   hour buckets do the work. Do *not* skip passing it and then filter on the leg
+   span — that reinstates the over-report with a bigger file.
 
 4. **Sample the curve, not the nodes.** Nodes are sparse Catmull-Rom control
    points, ~20 km apart at cruise over Europe. Testing only node containment
@@ -434,13 +432,12 @@ async function fetchRecords(url, legs, lids, gap = 4096, conc = 6) {
    (land p90 is 55–116 km). If you need this properly, ask for the flag to be
    plumbed through.
 
-6. **There is no callsign in the deployed data.** I checked the live files:
-   `legs.parquet` has `icao, reg, type, dep, arr` and `flights.parquet` has no
-   `flight` column either. The [bundle doc](bundle-format.md) claims "callsign, route,
-   times, bbox, all local" — **that line is wrong** on this branch;
-   `fit_spline.py` here emits no `callsigns.parquet` at all. Label aircraft by
-   `reg` (tail) or `type`, falling back to the `icao` hex, and do not build UI
-   that needs a flight number until the pipeline provides one.
+6. **The callsign is `flight`, and it is NULLable.** `legs.parquet` always has
+   the column, but it is NULL throughout for days built before `flights_schema`
+   **5**, so check `dates.json`'s `days[date].flights_schema`. Even at 5 an
+   individual leg can be NULL: readsb reports the callsign only on change, so
+   absence is not evidence of a callsign-less flight. Fall back to `reg` (tail)
+   or `type`, then the `icao` hex.
 
 Two smaller ones: `dep`/`arr` can be `null` (aircraft never seen on the ground)
 and can be **non-ICAO identifiers** from `airports.csv` such as `BE-0065` —

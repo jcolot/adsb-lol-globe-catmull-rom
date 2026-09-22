@@ -110,8 +110,8 @@ But **do not ramp on `n`**. It is a set union, so it grows with cell area: the
 coarser the cell, the more flights cross it, until every coarse cell converges on
 "lots" and the level is flat. On a real day, union-counting put western Europe's
 res-2 cells in the global top 2% with almost nothing between them — and no
-normalisation fixes that, because it is the metric, not the scale. Log-vs-p99 and
-a percentile rank were both tried and both flattened the busy regions.
+normalisation fixes that, because it is the metric, not the scale. Neither a
+log-vs-p99 scale nor a percentile rank helps; both flatten the busy regions.
 
 `dens` is the aggregation that works: **mean distinct flights per finest-resolution
 cell**, i.e. the accumulated total divided by the descendant count, with missing

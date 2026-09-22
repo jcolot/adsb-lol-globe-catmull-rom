@@ -56,7 +56,7 @@ diagnostic modules (`validate_recon.py` measures reconstruction error vs raw).
 | `on_ground` | bool | |
 | `cusp` | bool | **break the spline here** (taxi corner / ground↔air) |
 | `leg_id` | string | `{date}_{icao}_{k}` — unique across partitions, not just within one (schema 4+; older days are `{icao}_{k}`) |
-| `dep`, `arr`, `reg`, `type` | | leg / aircraft metadata |
+| `dep`, `arr`, `reg`, `type`, `flight` | | leg / aircraft metadata; `flight` is the callsign (schema 5+, NULLable) |
 | `base_ts` | int64 | **absolute UTC seconds = `base_ts + t/10`.** `t` alone is relative and not comparable between aircraft |
 | `t_off`, `t_on` | int64 | that leg's wheels-off / wheels-on, same units as `t`. Filter time on these, not on the first and last node — the node span includes taxi and ramp |
 | `dep_gnd`, `arr_gnd` | bool | false means that end never emitted a surface message, so the airport and the wheels time there are approximations |

@@ -20,13 +20,19 @@ would otherwise force two copies of the geometry.
 
 ## `legs.parquet` — one row per leg, shipped whole
 
-`lid`, `icao`, `leg_id`, `reg`, `type`, `dep`, `arr`, `t0`, `t1`, `n_nodes`, the
-bounding box (`min_lat`…`max_lon`, degrees × 1e5), `min_alt`/`max_alt` in feet,
-and `off`/`len` — the byte range of that leg's record in `tracks.bin`.
+`lid`, `icao`, `leg_id`, `reg`, `type`, `flight`, `dep`, `arr`, `t0`, `t1`,
+`n_nodes`, the bounding box (`min_lat`…`max_lon`, degrees × 1e5),
+`min_alt`/`max_alt` in feet, and `off`/`len` — the byte range of that leg's
+record in `tracks.bin`.
 
 `lid` is this file's row index and means nothing outside it; `leg_id` is the
 stable identity that joins to `flights.parquet`, the per-airport partitions and
 `spliced.parquet`, and from schema 4 on it carries its own date.
+
+`flight` is the callsign. The column is always present, but NULL throughout for
+days built before `flights_schema` 5, and NULLable on individual legs after it —
+readsb reports the callsign only on change, so absence is not evidence of a
+callsign-less flight.
 
 **`lid` is the row index**, so a posting list from `cells.bin` indexes this table
 directly with no lookup map.

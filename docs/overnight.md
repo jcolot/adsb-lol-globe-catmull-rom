@@ -122,16 +122,15 @@ when the data stopped — a real landing leaves descent or ground fixes after
 makes the key unique, and since any flight under 24 h contains at most one
 00:00Z, a leg is never cut into three.
 
-⚠️ **`t_on == t_end` is not by itself a midnight cut**, which an earlier version
-of this section wrongly claimed. It says only "still airborne at the last fix",
-and that is equally true of an aircraft that flew out of receiver coverage.
-Measured on 2026-09-08: of 11,768 legs matching it, only 31.8% had their last
-fix within an hour of the boundary and **42.4% were more than six hours from
-it** — coverage dropouts, not archive cuts. So a half must also be within
-`--max-gap-h` of the boundary. That does not change which pairs are accepted (a
-distant tail already fails the gap check), but it cut the misleading "no pair"
-count from 18,361 to 7,372 and moved 12,897 legs into a category that says what
-they are.
+⚠️ **`t_on == t_end` is not by itself a midnight cut.** It says only "still
+airborne at the last fix", and that is equally true of an aircraft that flew
+out of receiver coverage. Measured on 2026-09-08: of 11,768 legs matching it,
+only 31.8% had their last fix within an hour of the boundary and **42.4% were
+more than six hours from it** — coverage dropouts, not archive cuts. So a half
+must also be within `--max-gap-h` of the boundary. That does not change which
+pairs are accepted — a distant tail already fails the gap check — but it keeps
+12,897 coverage-dropout legs out of the "no pair" count, which reports 7,372
+rather than 18,361.
 
 Two more guards, both of which real data was needed to find:
 
@@ -193,12 +192,13 @@ one row per leg *departing* in D's UTC day, `dep`/`arr` both non-NULL, `t_off`
 and `t_on` in **absolute** deciseconds with `base_ts = 0` (so the usual
 `base_ts + t/10` still yields UTC), and a `spliced` flag.
 
-It is published because the repair was previously computed and thrown away. A
-client reading the partitions sees a flight airborne at 00:00Z as two half-legs
-with a NULL endpoint each — 46 of them touch EBBR's local day 2026-09-09 alone —
-and nothing it could fetch said they were one flight. A spliced row's `leg_id` is
-`<tail>+<head>`, and each half now carries its own date, so splitting on `+`
-maps straight back to the partition holding that half's geometry:
+It is published because the pipeline computes the repair anyway and a client
+cannot: reading the partitions, a flight airborne at 00:00Z appears as two
+half-legs with a NULL endpoint each — 46 of them touch EBBR's local day
+2026-09-09 alone — and nothing fetchable says they are one flight. A spliced
+row's `leg_id` is `<tail>+<head>`, and each half now carries its own date, so
+splitting on `+` maps straight back to the partition holding that half's
+geometry:
 
 ```js
 const [tail, head] = row.leg_id.split('+');
@@ -254,17 +254,17 @@ file with its Date Variation field.
 
 ### What it found: merged legs
 
-The comparison immediately surfaced a defect no synthetic fixture had. On
+The comparison surfaced a defect no synthetic fixture had. On
 IAD–EWR, which BTS puts at 44 min, the raw legs split into two clean
 populations — **36–71 min and 226–1000 min** — and *every one of them* had
 `dep_gnd` and `arr_gnd` true.
 
 So the ground-fix filter does **not** protect against the collapse described
-above, contrary to what an earlier version of this section implied. It catches
-only the aircraft that emit *no* surface message at all. An aircraft that emits
-them at the ends of its day but not at intermediate turnarounds has its
-consecutive flights fused into one leg carrying genuine ground fixes at both
-ends — and on a shuttle route that is roughly half the legs.
+above. It catches only the aircraft that emit *no* surface message at all. An
+aircraft that emits them at the ends of its day but not at intermediate
+turnarounds has its consecutive flights fused into one leg carrying genuine
+ground fixes at both ends — and on a shuttle route that is roughly half the
+legs.
 
 `MERGE_FACTOR` (default 2.0) drops a leg whose airborne time exceeds twice the
 distance model's expectation. The effect is exactly the right shape — it removes
