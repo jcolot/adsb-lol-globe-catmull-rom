@@ -49,8 +49,8 @@ usual `base_ts + t/10` rebase still yields absolute UTC seconds and downstream
 readers need no special case.
 
 Usage:
-  ./splice_legs.py --root legs --out legs_spliced.parquet
-  ./splice_legs.py 2026-08-01=a/flights.parquet 2026-08-02=b/flights.parquet \
+  ./overnight/splice_legs.py --root legs --out legs_spliced.parquet
+  ./overnight/splice_legs.py 2026-08-01=a/flights.parquet 2026-08-02=b/flights.parquet \
                    --out legs_spliced.parquet
 """
 import argparse, datetime as dt, glob, os, re, sys

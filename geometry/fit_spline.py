@@ -24,8 +24,8 @@ predictive-handle codec) is retained below as reference; it is not on the output
 path -- the stored format is Catmull-Rom nodes, not Beziers.
 
 Usage:
-    ./fit_spline.py subset_ebbr/traces --ground-elevation --parquet nodes   # batch
-    ./fit_spline.py path/to/trace_full_XXXX.json --dump                     # one flight
+    ./geometry/fit_spline.py subset_ebbr/traces --ground-elevation --parquet nodes   # batch
+    ./geometry/fit_spline.py path/to/trace_full_XXXX.json --dump                     # one flight
 """
 import argparse, gzip, heapq, math, os, sys, time
 import importlib.util
@@ -35,6 +35,7 @@ def _load(mod, path):
     s = importlib.util.spec_from_file_location(mod, path); m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m); return m
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # airports.csv lives at the repo root
 ct = _load("ct", os.path.join(HERE, "compress_trace.py"))
 st = _load("st", os.path.join(HERE, "smooth_trace.py"))
 
@@ -723,7 +724,7 @@ def _work(path):
 def write_parquet(files, a):
     import multiprocessing as mp
     import pyarrow as pa, pyarrow.parquet as pq
-    csvp = a.airports or os.path.join(HERE, "airports.csv")
+    csvp = a.airports or os.path.join(ROOT, "airports.csv")
     C = dict(icao=[], t=[], lat=[], lon=[], alt=[], on_ground=[], cusp=[], base_ts=[])
     meta = dict(icao=[], reg=[], type=[], desc=[], base_ts=[])
     E = dict(icao=[], kind=[], t0=[], t1=[], lat=[], lon=[], n=[])
@@ -833,7 +834,7 @@ def main():
 
     elev_fn = None
     if a.ge:
-        csvp = a.airports or os.path.join(HERE, "airports.csv")
+        csvp = a.airports or os.path.join(ROOT, "airports.csv")
         elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))
 
     if a.dump:

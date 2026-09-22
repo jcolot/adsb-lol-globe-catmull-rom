@@ -57,7 +57,7 @@ It streams the release tar from stdin and stages nothing:
 ```sh
 urls=$(gh api "repos/adsblol/globe_history_2026/releases/tags/$TAG" \
         --jq '.assets[].browser_download_url' | sort | tr '\n' ' ')
-curl -fsSL $urls | python3 build_grid.py --tar-stream --out grids/$DATE.npz
+curl -fsSL $urls | python3 raster/build_grid.py --tar-stream --out grids/$DATE.npz
 ```
 
 It does **not** bin raw fixes. Fix density is a map of the feeder network and of

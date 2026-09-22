@@ -18,7 +18,7 @@ Two modes:
     round-trips the blobs back and checks them.
 
 Usage:
-    ./compress_trace.py FILE_OR_DIR ... [options]
+    ./geometry/compress_trace.py FILE_OR_DIR ... [options]
       --max-speed 1300  outlier gate, km/h                     (default 1300)
       --h-ground 10     horiz tol on the ground, m             (default 10)
       --h-low    20     horiz tol at/below --low-alt, m         (default 20)
@@ -750,8 +750,8 @@ def write_parquet(files, tol, a):
     if a.ground_elev:
         csvp = a.airports
         if not csvp:
-            here = os.path.dirname(os.path.abspath(__file__))
-            for cand in (os.path.join(here, "airports.csv"), "airports.csv"):
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for cand in (os.path.join(root, "airports.csv"), "airports.csv"):
                 if os.path.exists(cand):
                     csvp = cand
                     break

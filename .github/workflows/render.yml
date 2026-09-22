@@ -122,7 +122,7 @@ jobs:
           # rewrite of rolling_mean/trailing_baseline; the runner has 16 GB.
           # If a much longer span ever OOMs here, build the grids at
           # --grid-zoom 1 instead of trying to trim the render.
-          python3 render_video.py \
+          python3 raster/render_video.py \
             --grids grids --out-dir out \
             --mode "$MODE" \
             --smooth "$SMOOTH" \

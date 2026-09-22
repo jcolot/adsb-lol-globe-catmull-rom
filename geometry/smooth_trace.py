@@ -22,8 +22,8 @@ spikes and taxi reversals all fall out of this one estimator instead of separate
 heuristic gates.
 
 Usage:
-    ./smooth_trace.py subset_ebbr/traces --out subset_smooth [--ground-elevation]
-    ./smooth_trace.py path/to/trace_full_XXXX.json --dump      # print one track
+    ./geometry/smooth_trace.py subset_ebbr/traces --out subset_smooth [--ground-elevation]
+    ./geometry/smooth_trace.py path/to/trace_full_XXXX.json --dump      # print one track
 """
 import argparse, glob, math, os, sys
 import numpy as np
@@ -306,8 +306,8 @@ def main():
     if a.ge:
         csvp = a.airports
         if not csvp:
-            here = os.path.dirname(os.path.abspath(__file__))
-            for c in (os.path.join(here, "airports.csv"), "airports.csv"):
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for c in (os.path.join(root, "airports.csv"), "airports.csv"):
                 if os.path.exists(c):
                     csvp = c; break
         elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))

@@ -20,10 +20,10 @@ Mirrors the JS decoder in docs/overnight.md line for line, including the two-pas
 departure offset and the 3-day window guard.
 
 Usage:
-  ./overnight_client.py --dir legs/date=2026-09-08 \\
+  ./overnight/overnight_client.py --dir legs/date=2026-09-08 \\
       --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
 
-  ./overnight_client.py --base-url https://pub-XXXX.r2.dev/legs \\
+  ./overnight/overnight_client.py --base-url https://pub-XXXX.r2.dev/legs \\
       --date 2026-09-08 --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
 """
 import argparse, datetime as dt, json, math, os, sys, tempfile

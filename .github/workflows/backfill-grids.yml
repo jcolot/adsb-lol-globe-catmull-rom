@@ -196,7 +196,7 @@ jobs:
               # overlaps the download with the parse, so only CPU is billed.
               for attempt in 1 2 3; do
                 if curl -fsSL "${urls[@]}" \
-                     | python3 build_grid.py --tar-stream \
+                     | python3 raster/build_grid.py --tar-stream \
                          --out "grids/$d.npz" \
                          --grid-zoom "$GRID_ZOOM" \
                          --gap-mode "$GAP_MODE" \

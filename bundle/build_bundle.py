@@ -37,6 +37,7 @@ import pyarrow.parquet as pq
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+RASTER = os.path.join(os.path.dirname(HERE), "raster")
 
 # reuse the CR reconstruction + densify SQL rather than restating it
 def _load(name, path):
@@ -45,7 +46,11 @@ def _load(name, path):
     s.loader.exec_module(m)
     return m
 
-bh = _load("bh", os.path.join(HERE, "build_hexes.py"))
+# build_hexes lives in raster/ and imports hex_raster from beside itself, so that
+# directory has to be importable before it is executed here.
+if RASTER not in sys.path:
+    sys.path.insert(0, RASTER)
+bh = _load("bh", os.path.join(RASTER, "build_hexes.py"))
 
 
 def _arrow(rel):

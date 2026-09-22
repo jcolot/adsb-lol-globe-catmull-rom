@@ -24,24 +24,38 @@ hour?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages
 
-1. **`fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`, plus
+1. **`geometry/fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`, plus
    `callsigns.parquet` and `events.parquet`. Per-second decimation (mean position
    **and** time), stationary-gate snapping, ground-elevation reference, greedy
    CR-node placement. **`events.parquet` has no consumer yet** — `build_legs.py`
    reads `callsigns.parquet` but not the gate dwells and airborne runs, so that
    file is written and unread.
-2. **`build_legs.py`** — `nodes.parquet → legs/` (per-airport partitions +
+2. **`bundle/build_legs.py`** — `nodes.parquet → legs/` (per-airport partitions +
    `flights.parquet` index), stamping the callsign from `callsigns.parquet` onto
    each leg.
-3. **`build_hexes.py`** — `points_legs.parquet → traffic-raster.pmtiles` (H3
+3. **`raster/build_hexes.py`** — `points_legs.parquet → traffic-raster.pmtiles` (H3
    traffic density as a raster overview; `hex_raster.py` renders it). The vector
    hexbin archive is optional and **off by default** — see [docs/h3-tiles.md](docs/h3-tiles.md).
-4. **`build_bundle.py`** — `points_legs.parquet → legs.parquet + cells.bin +
+4. **`bundle/build_bundle.py`** — `points_legs.parquet → legs.parquet + cells.bin +
    tracks.bin + meta.json` (the queryable **day bundle** — see [docs/bundle-format.md](docs/bundle-format.md)).
    `verify_bundle.py` is its correctness gate and the reference decoder.
 
 `smooth_trace.py`, `compress_trace.py`, `validate_recon.py` are supporting /
 diagnostic modules (`validate_recon.py` measures reconstruction error vs raw).
+
+### Layout
+
+| directory | holds |
+|---|---|
+| `geometry/` | trace decoding, smoothing and Catmull-Rom fitting. These four load each other by path, so they stay together |
+| `raster/` | `hex_raster.py` and its three consumers — H3 tiles, daily density grids, video |
+| `bundle/` | leg partitioning and the day bundle, plus its verifier |
+| `overnight/` | timezone/date-offset classification, the daily splice and the reference client |
+
+`airports.csv` and `airport_tz.csv` stay at the repo root: more than one group
+reads them. Scripts are run by path (`python3 geometry/fit_spline.py …`) and
+resolve their siblings relative to their own file, so there is no package to
+install and no `PYTHONPATH` to set.
 
 ## Output schema
 
@@ -71,16 +85,16 @@ see [Frontend: all flights at one airport, for a local day](docs/bundle-format.m
 
 ```bash
 pip install -r requirements.txt
-python3 fit_spline.py path/to/traces --ground-elevation \
+python3 geometry/fit_spline.py path/to/traces --ground-elevation \
     --parquet nodes --tol-ground 2 --tol-cruise 150 --corner 35
-python3 build_legs.py --traces nodes/nodes.parquet \
+python3 bundle/build_legs.py --traces nodes/nodes.parquet \
     --meta nodes/aircraft.parquet --callsigns nodes/callsigns.parquet \
     --out-dir out/legs
-python3 build_hexes.py --points out/legs/points_legs.parquet \
+python3 raster/build_hexes.py --points out/legs/points_legs.parquet \
     --out out/legs/traffic.pmtiles
-python3 build_bundle.py --points out/legs/points_legs.parquet \
+python3 bundle/build_bundle.py --points out/legs/points_legs.parquet \
     --meta nodes/aircraft.parquet --out-dir out/legs
-python3 verify_bundle.py --bundle out/legs \
+python3 bundle/verify_bundle.py --bundle out/legs \
     --points out/legs/points_legs.parquet --meta nodes/aircraft.parquet
 ```
 

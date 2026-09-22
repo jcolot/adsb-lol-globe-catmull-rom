@@ -178,11 +178,11 @@ day lagged** — clients need to know which days are settled, and the oldest
 retained day has no predecessor, leaving its early-morning arrivals unresolved.
 
 ```bash
-./build_airport_tz.py                     # once; needs timezonefinder
-./splice_legs.py --root legs --out legs_spliced.parquet
-./overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
-./overnight.py --legs legs_spliced.parquet --fit
-./overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
+./overnight/build_airport_tz.py                     # once; needs timezonefinder
+./overnight/splice_legs.py --root legs --out legs_spliced.parquet
+./overnight/overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
+./overnight/overnight.py --legs legs_spliced.parquet --fit
+./overnight/overnight.py --legs legs_spliced.parquet --build-table overnight.parquet
 ```
 
 ## Reading the splice
@@ -410,11 +410,11 @@ the only arithmetic is integer minutes.
 
 ```bash
 # a local partition
-./overnight_client.py --dir legs/date=2026-09-08 \
+./overnight/overnight_client.py --dir legs/date=2026-09-08 \
     --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
 
 # or straight off R2, fetching the three files itself
-./overnight_client.py --base-url https://pub-XXXX.r2.dev/legs \
+./overnight/overnight_client.py --base-url https://pub-XXXX.r2.dev/legs \
     --date 2026-09-08 --dep KJFK --arr EGLL --arr-local '2026-09-08 09:20'
 ```
 

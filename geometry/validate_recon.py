@@ -15,6 +15,7 @@ def _load(m, p):
     s = importlib.util.spec_from_file_location(m, p); x = importlib.util.module_from_spec(s)
     s.loader.exec_module(x); return x
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # airports.csv lives at the repo root
 ct = _load("ct", os.path.join(HERE, "compress_trace.py"))
 fb = _load("fb", os.path.join(HERE, "fit_spline.py"))
 
@@ -100,7 +101,7 @@ def main():
     a = ap.parse_args()
     elev_fn = None
     if a.ge:
-        csvp = a.airports or os.path.join(HERE, "airports.csv")
+        csvp = a.airports or os.path.join(ROOT, "airports.csv")
         elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))
     files = ct.collect(a.paths, a.limit)
     rows = []

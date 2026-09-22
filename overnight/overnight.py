@@ -38,9 +38,9 @@ Sources of block time, best first:
   2. the distance model, for pairs never observed.
 
 Usage:
-  ./overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 10:15'
-  ./overnight.py --legs airport_ds/flights.parquet --fit
-  ./overnight.py --legs airport_ds/flights.parquet --build-table overnight.parquet
+  ./overnight/overnight.py --dep KJFK --arr EGLL --arr-local '2026-09-08 10:15'
+  ./overnight/overnight.py --legs airport_ds/flights.parquet --fit
+  ./overnight/overnight.py --legs airport_ds/flights.parquet --build-table overnight.parquet
 """
 import argparse, csv, datetime as dt, math, os, sys
 from zoneinfo import ZoneInfo

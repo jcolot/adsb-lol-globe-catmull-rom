@@ -2,11 +2,11 @@
 # Daily ADS-B trace pipeline, split into phases so each can run as its own CI step:
 #   resolve  -> find the adsblol release tag for the variant (SRC_DATE, else latest)
 #   fetch    -> stream the split-tar assets straight into tar (no 4-6 GB staged)
-#   fit      -> fit sparse Catmull-Rom spline nodes (fit_spline.py)
-#   legs     -> split into per-airport leg partitions (build_legs.py)
+#   fit      -> fit sparse Catmull-Rom spline nodes (geometry/fit_spline.py)
+#   legs     -> split into per-airport leg partitions (bundle/build_legs.py)
 #   hexes    -> H3 traffic-density tiles: a raster overview + vector hexbins
-#   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (build_bundle.py)
-#   overnight-> static overnight-classification artifacts (overnight.py)
+#   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (bundle/build_bundle.py)
+#   overnight-> static overnight-classification artifacts (overnight/overnight.py)
 #   upload   -> rclone sync the legs to Cloudflare R2
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
 # / `run_pipeline.sh all`). Phases share state through $WORK (the resolved tag is
@@ -97,7 +97,7 @@ fetch() {
 }
 
 fit() {
-    python3 "$SCRIPT_DIR/fit_spline.py" "$WORK/traces" --ground-elevation \
+    python3 "$SCRIPT_DIR/geometry/fit_spline.py" "$WORK/traces" --ground-elevation \
         --airports "$SCRIPT_DIR/airports.csv" --parquet "$WORK/nodes" \
         --tol-ground "$TOL_GROUND" --tol-cruise "$TOL_CRUISE" --corner "$CORNER"
 }
@@ -109,7 +109,7 @@ fit() {
 legs() {
     local date; date="$(data_date)"
     mkdir -p "$OUT"; rm -rf "$OUT/legs"
-    python3 "$SCRIPT_DIR/build_legs.py" \
+    python3 "$SCRIPT_DIR/bundle/build_legs.py" \
         --traces "$WORK/nodes/nodes.parquet" --date "$date" \
         --meta "$WORK/nodes/aircraft.parquet" \
         --callsigns "$WORK/nodes/callsigns.parquet" --out-dir "$OUT/legs"
@@ -123,7 +123,7 @@ legs() {
 # day (85 of that in res 6 alone) against the raster's 8 MB. Set HEX_VECTOR=1 to
 # get it back for per-cell tooltips or queries; that also needs tippecanoe.
 hexes() {
-    python3 "$SCRIPT_DIR/build_hexes.py" \
+    python3 "$SCRIPT_DIR/raster/build_hexes.py" \
         --points "$OUT/legs/points_legs.parquet" \
         --raster-out "$OUT/legs/traffic-raster.pmtiles" \
         ${HEX_VECTOR:+--out "$OUT/legs/traffic.pmtiles"} \
@@ -141,14 +141,14 @@ hexes() {
 # one: a bundle whose byte offsets are wrong is worse than no bundle at all, so
 # it must not be possible to upload one that hasn't been checked.
 bundle() {
-    python3 "$SCRIPT_DIR/build_bundle.py" \
+    python3 "$SCRIPT_DIR/bundle/build_bundle.py" \
         --points "$OUT/legs/points_legs.parquet" \
         --meta "$WORK/nodes/aircraft.parquet" \
         --out-dir "$OUT/legs" \
         --index-res "$IDX_RES" --buckets "$BUNDLE_BUCKETS" \
         --bucket-minutes "$IDX_BUCKET_MIN" \
         ${BUNDLE_MEMORY:+--memory-limit "$BUNDLE_MEMORY"}
-    python3 "$SCRIPT_DIR/verify_bundle.py" \
+    python3 "$SCRIPT_DIR/bundle/verify_bundle.py" \
         --bundle "$OUT/legs" \
         --points "$OUT/legs/points_legs.parquet" \
         --meta "$WORK/nodes/aircraft.parquet" \
@@ -180,12 +180,12 @@ overnight() {
     if [ -n "${R2_BUCKET:-}" ] && rclone copyto \
             "r2:$R2_BUCKET/$R2_PREFIX/date=$prev/flights.parquet" "$prev_legs" \
             --ignore-errors 2>/dev/null && [ -s "$prev_legs" ]; then
-        python3 "$SCRIPT_DIR/splice_legs.py" \
+        python3 "$SCRIPT_DIR/overnight/splice_legs.py" \
             "$prev=$prev_legs" "$date=$OUT/legs/flights.parquet" \
             --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
             --max-gap-h "$OVN_MAX_GAP_H" --dep-date "$prev" \
             --out "$WORK/overnight/spliced.parquet"
-        python3 "$SCRIPT_DIR/overnight.py" \
+        python3 "$SCRIPT_DIR/overnight/overnight.py" \
             --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
             --legs "$WORK/overnight/spliced.parquet" \
             --build-table "$WORK/overnight/overnight.parquet"
@@ -200,7 +200,7 @@ overnight() {
     # ~2.5 KB a day (measured: 89 KB for 4 dates, 160 KB for 32) and upload()
     # copies the newest one to the bucket ROOT, where it is not pruned and one
     # fetch answers every date the archive still holds.
-    python3 "$SCRIPT_DIR/overnight.py" \
+    python3 "$SCRIPT_DIR/overnight/overnight.py" \
         --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
         --emit-client "$OUT/legs" --date "$date" \
         --tz-back "${RETENTION_DAYS:-30}" "${table_args[@]}"
