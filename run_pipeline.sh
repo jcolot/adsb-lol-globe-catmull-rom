@@ -260,6 +260,11 @@ upload() {
     local keep="${RETENTION_DAYS:-30}"
     local base="r2:$R2_BUCKET/$R2_PREFIX"
     local date; date="$(data_date)"
+    # Only the closing DONE line uses this. It went missing when the date
+    # stopped being parsed out of the tag, which left that line reading an
+    # unset variable -- fatal under `set -u`, and only on the upload phase,
+    # which the workflow runs as its own process so nothing else had set it.
+    local tag; tag="$(cat "$TAGFILE" 2>/dev/null || echo '?')"
 
     # each day is its own self-contained prefix; sync only touches THIS date, so
     # other days are never deleted. points_legs.parquet is a build intermediate
