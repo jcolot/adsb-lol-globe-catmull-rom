@@ -24,12 +24,10 @@ hour?" with **zero further requests**, then one HTTP range read per track drawn.
 
 ### Stages
 
-1. **`geometry/fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`, plus
-   `callsigns.parquet` and `events.parquet`. Per-second decimation (mean position
-   **and** time), stationary-gate snapping, ground-elevation reference, greedy
-   CR-node placement. **`events.parquet` has no consumer yet** — `build_legs.py`
-   reads `callsigns.parquet` but not the gate dwells and airborne runs, so that
-   file is written and unread.
+1. **`geometry/fit_spline.py`** — `traces/ → nodes.parquet` + `aircraft.parquet`,
+   plus `callsigns.parquet`. Per-second decimation (mean position **and** time),
+   stationary-gate snapping, ground-elevation reference, greedy CR-node
+   placement.
 2. **`bundle/build_legs.py`** — `nodes.parquet → legs/` (per-airport partitions +
    `flights.parquet` index), stamping the callsign from `callsigns.parquet` onto
    each leg.

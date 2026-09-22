@@ -14,10 +14,9 @@ Output (--parquet DIR): nodes.parquet + aircraft.parquet. Columns t (deciseconds
 relative to this trace's own base_ts), lat, lon (fixed-point), alt (ft), on_ground,
 cusp, base_ts -- DELTA_BINARY_PACKED + zstd.
 
-Also events.parquet (gate dwells + airborne runs -- the OOOI candidates, see
-extract_events) and callsigns.parquet, both consumed by build_legs.py to stamp
-OUT/OFF/ON/IN and the flight number onto each leg. Their times are absolute
-instants, so they are TIMESTAMP(ms, UTC) rather than a relative tick.
+Also callsigns.parquet (see extract_callsigns), consumed by build_legs.py to
+stamp the flight number onto each leg. Its times are absolute instants, so they
+are TIMESTAMP(ms, UTC) rather than a relative tick.
 
 The Schneider cubic-Bezier fitter (gen_bezier / fit_curve / build_nodes / the
 predictive-handle codec) is retained below as reference; it is not on the output
@@ -432,15 +431,9 @@ def _snap_stationary(ms, stop_kt=3.0, dwell_s=20.0, bbox_m=40.0):
     is snapped to the centroid when the run is a real dwell (lasts >= dwell_s -- a
     taxiing aircraft never sustains < stop_kt that long, even while drifting on GPS)
     or is spatially tight; the >=1 m dedup then keeps just the dwell's endpoints. A
-    brief low-speed taxi wobble (short and not tight) keeps its positions.
-
-    Returns (ms, dwells). Collapsing to a centroid is lossy in TIME as well as
-    space -- the run's first and last timestamps are exactly the OUT/IN candidates
-    (brake set -> brake release), so each run lasting >= dwell_s is reported as
-    (t0, t1, lat, lon, n) BEFORE the collapse. Geometry is unaffected."""
-    if not ms: return ms, []
+    brief low-speed taxi wobble (short and not tight) keeps its positions."""
+    if not ms: return ms
     def stat(m): return m["gs"] is not None and m["gs"] < stop_kt
-    dwells = []
     i = 0; n = len(ms)
     while i < n:
         if not stat(ms[i]): i += 1; continue
@@ -453,52 +446,33 @@ def _snap_stationary(ms, stop_kt=3.0, dwell_s=20.0, bbox_m=40.0):
         dur = run[-1]["t"]-run[0]["t"]
         collapse = (dur >= dwell_s) or (len(run) >= 3 and dm < bbox_m)
         clat = sum(lats)/len(run); clon = sum(lons)/len(run)
-        if dur >= dwell_s:
-            dwells.append((float(run[0]["t"]), float(run[-1]["t"]),
-                           clat, clon, len(run)))
         for m in run:
             m["gnd"] = True
             if collapse: m["lat"] = clat; m["lon"] = clon
         i = j
-    return ms, dwells
+    return ms
 
 
-def extract_events(d, stop_kt=3.0, dwell_s=20.0, bbox_m=40.0, min_air_s=30.0):
-    """Derive OOOI candidate events from the FULL-RATE trace, independent of the fit.
+def extract_callsigns(d):
+    """Callsign changes from the FULL-RATE trace, independent of the fit.
 
-    Reading events off the stored CR nodes would be wrong: greedy node placement
-    optimises curve fidelity, so on a long straight taxi the nearest node can sit
-    tens of seconds away from the brake release, and the >=1 m dedup in
-    build_nodes_cr discards stationary ground samples outright. This pass therefore
-    works on st.parse output with only the on-ground correction applied -- the same
-    _snap_stationary the geometry path uses, at full rate. It is O(n) and negligible
-    next to the fit, and it does not touch the geometry output.
+    Reading them off the stored CR nodes would be wrong: greedy node placement
+    optimises curve fidelity, and the >=1 m dedup in build_nodes_cr discards
+    stationary ground samples outright, so the node nearest a change can sit tens
+    of seconds from it. This pass therefore works on st.parse output at full rate.
+    It is O(n) and negligible next to the fit, and it does not touch the geometry
+    output.
 
-    Returns dict(dwells=[(t0,t1,lat,lon,n)], airborne=[(t_off,t_on)],
-                 callsigns=[(t,flight)]) with t in SECONDS relative to the trace's
-    `timestamp` base."""
+    Returns [(t, flight)], sparse -- one entry per change -- with t in SECONDS
+    relative to the trace's `timestamp` base."""
     ms = st.parse(d)
     if len(ms) < 2: return None
-    ms, dwells = _snap_stationary(ms, stop_kt, dwell_s, bbox_m)
-    air = []
-    i = 0; n = len(ms)
-    while i < n:
-        if ms[i]["gnd"]: i += 1; continue
-        j = i
-        while j < n and not ms[j]["gnd"]: j += 1
-        # The transition happened somewhere in the gap between the last on-ground
-        # and first airborne sample, so take the midpoint -- an unbiased estimate,
-        # where picking either endpoint is systematically early or late.
-        t_off = (float(ms[i-1]["t"])+float(ms[i]["t"]))/2 if i > 0 else float(ms[i]["t"])
-        t_on = (float(ms[j-1]["t"])+float(ms[j]["t"]))/2 if j < n else float(ms[j-1]["t"])
-        if t_on-t_off >= min_air_s: air.append((t_off, t_on))
-        i = j
     cs = []
     for m in ms:                                   # sparse: only on change
         f = m.get("flight")
         if f and (not cs or cs[-1][1] != f):
             cs.append((float(m["t"]), f))
-    return dict(dwells=dwells, airborne=air, callsigns=cs)
+    return cs
 
 
 def insert_gc_nodes(nodes, kx, max_gap_km=200.0):
@@ -567,7 +541,7 @@ def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
     draws) stays within the graduated tolerance -- so NO handles need storing.
     Splits at sharp corners / ground<->air (cusps), greedy-inserts within each."""
     ms = st.parse(d)
-    ms = _decimate_1hz(ms); ms, _ = _snap_stationary(ms); n0 = len(ms)
+    ms = _decimate_1hz(ms); ms = _snap_stationary(ms); n0 = len(ms)
     if n0 < 3: return None
     geom = [m["geom"] for m in ms]
     baro = [m["baro"] if not m["gnd"] else None for m in ms]
@@ -705,18 +679,15 @@ def _work(path):
             return None
         cols = light_columns(fit)
         base = int(d.get("timestamp", 0))
-        # OOOI candidates are stamped to ABSOLUTE instants here (epoch ms, stored
+        # Callsign changes are stamped to ABSOLUTE instants here (epoch ms, stored
         # as TIMESTAMP): `t` in nodes.parquet stays int32-relative to this file's
-        # own base, but events must be comparable across day-boundary releases.
-        ev = extract_events(d) or dict(dwells=[], airborne=[], callsigns=[])
+        # own base, but these must be comparable across day-boundary releases.
+        cs = extract_callsigns(d) or []
         epoch_ms = lambda x: int(round((base+x)*1000))
         return dict(icao=d.get("icao") or os.path.basename(path)[11:17],
                     reg=d.get("r"), type=d.get("t"), desc=d.get("desc"),
                     base_ts=base, n_raw=fit["n_raw"], cols=cols,
-                    dwells=[(epoch_ms(t0), epoch_ms(t1), la, lo, k)
-                            for (t0, t1, la, lo, k) in ev["dwells"]],
-                    airborne=[(epoch_ms(t0), epoch_ms(t1)) for (t0, t1) in ev["airborne"]],
-                    callsigns=[(epoch_ms(t), f) for (t, f) in ev["callsigns"]])
+                    callsigns=[(epoch_ms(t), f) for (t, f) in cs])
     except Exception as e:
         return dict(err=f"{os.path.basename(path)}: {e}")
 
@@ -727,7 +698,6 @@ def write_parquet(files, a):
     csvp = a.airports or os.path.join(ROOT, "airports.csv")
     C = dict(icao=[], t=[], lat=[], lon=[], alt=[], on_ground=[], cusp=[], base_ts=[])
     meta = dict(icao=[], reg=[], type=[], desc=[], base_ts=[])
-    E = dict(icao=[], kind=[], t0=[], t1=[], lat=[], lon=[], n=[])
     K = dict(icao=[], t=[], flight=[])
     tot_raw = n_ac = 0
     t0 = time.perf_counter()
@@ -745,15 +715,6 @@ def write_parquet(files, a):
                 C[k] += c[k]
             for k in ("icao", "reg", "type", "desc", "base_ts"):
                 meta[k].append(r[k])
-            for (et0, et1, la, lo, k) in r["dwells"]:
-                E["icao"].append(r["icao"]); E["kind"].append("dwell")
-                E["t0"].append(et0); E["t1"].append(et1)
-                E["lat"].append(int(round(la*Q_POS))); E["lon"].append(int(round(lo*Q_POS)))
-                E["n"].append(k)
-            for (et0, et1) in r["airborne"]:
-                E["icao"].append(r["icao"]); E["kind"].append("air")
-                E["t0"].append(et0); E["t1"].append(et1)
-                E["lat"].append(None); E["lon"].append(None); E["n"].append(None)
             for (kt, f) in r["callsigns"]:
                 K["icao"].append(r["icao"]); K["t"].append(kt)
                 K["flight"].append(f)
@@ -785,12 +746,6 @@ def write_parquet(files, a):
     # relative offset and stays an integer tick). ms is well beyond ADS-B's own
     # timing, so nothing is lost.
     TS = pa.timestamp("ms", tz="UTC")
-    eschema = pa.schema([("icao", pa.string()), ("kind", pa.string()),
-        ("t0", TS), ("t1", TS), ("lat", pa.int32()),
-        ("lon", pa.int32()), ("n", pa.int32())])
-    et = pa.table(E, schema=eschema).sort_by([("icao", "ascending"), ("t0", "ascending")])
-    epath = os.path.join(a.parquet, "events.parquet")
-    pq.write_table(et, epath, compression="zstd", use_dictionary=["icao", "kind"])
     kschema = pa.schema([("icao", pa.string()), ("t", TS), ("flight", pa.string())])
     kt = pa.table(K, schema=kschema).sort_by([("icao", "ascending"), ("t", "ascending")])
     kpath = os.path.join(a.parquet, "callsigns.parquet")
@@ -798,16 +753,13 @@ def write_parquet(files, a):
 
     nodes = len(C["t"]); psz = os.path.getsize(ppath)
     msz = os.path.getsize(mpath); src = sum(os.path.getsize(f) for f in files)
-    esz = os.path.getsize(epath); ksz = os.path.getsize(kpath)
-    n_dwell = sum(1 for x in E["kind"] if x == "dwell")
+    ksz = os.path.getsize(kpath)
     print(f"\nCR-FIT PARQUET -> {a.parquet}  ({n_ac} aircraft, {a.workers} workers)")
     print(f"  raw points     : {tot_raw:,}")
     print(f"  nodes          : {nodes:,}  ({tot_raw/max(nodes,1):.1f}x fewer than raw)")
     print(f"  fit+write time : {wall:.1f}s   ({wall/max(n_ac,1)*78000/60:.1f} min for 78k)")
     print(f"  nodes.parquet  : {psz:,} B  ({psz/max(nodes,1):.1f} B/node, {psz/max(tot_raw,1):.2f} B/raw-pt)")
     print(f"  aircraft.parquet: {msz:,} B")
-    print(f"  events.parquet : {esz:,} B  ({n_dwell:,} dwells, "
-          f"{len(E['kind'])-n_dwell:,} airborne runs)")
     print(f"  callsigns.parquet: {ksz:,} B  ({len(K['t']):,} callsign changes)")
     print(f"  source (gz)    : {src:,} B   -> {src/max(psz+msz,1):.1f}x overall")
 
