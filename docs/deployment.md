@@ -1,26 +1,54 @@
 # Daily automation
 
 `.github/workflows/daily.yml` runs at **04:00 UTC** (after the ~03:26 UTC
-`prod-0` release drops) and uploads `legs/` to Cloudflare R2 via `rclone`. It
+`prod-0` release drops) and uploads `legs/` to OVH Object Storage via `rclone`.
+GitHub routinely fires the schedule hours late — observed starting between 08:34
+and 09:39 UTC across a week — so treat 04:00 as the earliest, not the time. It
 builds tippecanoe from source (cached by `TIPPECANOE_REF`) for the hexes step.
 The `bundle` phase runs `verify_bundle.py` before upload and fails the job on any
 check — a bundle with wrong byte offsets is worse than no bundle.
 
 ## Configuration
 
-Repo **variable**: `R2_BUCKET` — the R2 bucket name.
+Repo **variable**: `R2_BUCKET` — the bucket name.
 
 Repo **secrets**:
 
 | secret | value |
 |---|---|
-| `R2_ACCESS_KEY_ID` | R2 API token access key |
-| `R2_SECRET_ACCESS_KEY` | R2 API token secret |
-| `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |
+| `R2_ACCESS_KEY_ID` | S3 access key |
+| `R2_SECRET_ACCESS_KEY` | S3 secret key |
+| `R2_ENDPOINT` | `https://s3.<region>.io.cloud.ovh.net` |
 
-R2 has **no egress fees**, so the browser range-fetches partitions directly.
+The names are historical, as is the rclone remote called `r2` that the scripts
+address as `r2:` in ~30 places. They point at OVH. Renaming is cosmetic and has
+not been worth doing during a live migration.
+
+The remote is assembled entirely from `RCLONE_CONFIG_R2_*` env vars in
+`daily.yml` and `render.yml`, so there is no config file. Two values are not
+obvious:
+
+- `PROVIDER: Other` — rclone has no OVH entry, and `Cloudflare` would keep R2's
+  quirk handling (checksum and multipart behaviour) pointed at a bucket that
+  does not share those quirks.
+- `REGION: eu-west-par` — R2 accepts `auto`; OVH wants the real region, and it
+  must agree with the endpoint host.
+
+**Egress, data retrieval and API requests are all free** on OVH Object Storage
+Standard, so the browser range-fetches partitions directly. Storage is the only
+metered line, ~$0.0157/GiB/month for the first 50 TiB. Use the **Standard**
+class, not Cold Archive, which charges for retrieval.
 
 ## Frontend read URL
+
+> **Mid-migration.** The pipeline WRITES to OVH; the frontend still READS from
+> R2, so the URL below is deliberately still the `r2.dev` one. The OVH bucket is
+> public, range-readable and CORS-enabled, but holds only the days uploaded since
+> the switch, while R2 holds the full retention window. Cutting over means
+> changing this base URL in `docs/frontend-cell-query.md`, here, and
+> `overnight/overnight_client.py` — and either accepting a short day picker until
+> the nightly runs refill, or backfilling R2 → OVH first. Keep R2 as a rollback
+> until OVH has a few days on it.
 
 Public bucket base (r2.dev dev URL — rate-limited, not CDN-cached, fine to start):
 
@@ -72,26 +100,75 @@ otherwise emit `data_0`, `data_1`, … per busy airport, which a browser can't
 discover over HTTP since it can't list a directory). Fetch `data_0.parquet` and
 you have the whole airport for that day.
 
-To move to a CDN-cached custom domain later (e.g. `splines.<domain>`), connect it
-in **R2 → bucket → Settings → Custom Domains**; only this base URL changes on the
-frontend — the pipeline is unaffected.
+To move to a CDN-cached custom domain later (e.g. `splines.<domain>`), put a CDN
+in front of the bucket; only this base URL changes on the frontend — the pipeline
+is unaffected.
 
 ## CORS
 
-hyparquet and pmtiles.js both issue cross-origin **Range** requests, so set the
-bucket CORS policy (**R2 → bucket → Settings → CORS**) to allow your frontend
-origin:
+hyparquet and pmtiles.js both issue cross-origin **Range** requests, so the
+bucket needs a CORS policy allowing your frontend origin. OVH has no dashboard
+panel for this; apply [`cors.json`](../cors.json) with the S3 API:
 
-```json
-[{"AllowedOrigins":["https://timefli.es","http://localhost:4200"],
-  "AllowedMethods":["GET","HEAD"],
-  "AllowedHeaders":["range","content-type"],
-  "ExposeHeaders":["content-length","content-range","accept-ranges","etag"],
-  "MaxAgeSeconds":3600}]
+```sh
+aws --profile <owner> s3api put-bucket-cors \
+    --bucket <bucket> --cors-configuration file://cors.json \
+    --endpoint-url https://s3.<region>.io.cloud.ovh.net
 ```
 
-(`etag` is exposed for pmtiles.js, which uses it to detect an archive changing
-underneath a partially-read index.)
+`range` in `AllowedHeaders` is load-bearing: without it the preflight rejects the
+header hyparquet sends and every ranged read fails, which is all of them. `etag`
+is exposed for pmtiles.js, which uses it to detect an archive changing underneath
+a partially-read index. Origins match scheme + host + port exactly, so
+`https://timefli.es` does not cover `https://www.timefli.es` and one dev port
+does not cover another.
 
-(Add `https://www.timefli.es` or other dev ports here if the frontend ever loads
-from them — CORS origins must match scheme + host + port exactly.)
+**It must be applied by the bucket OWNER, not the pipeline user.** This is worth
+stating plainly because the failure is opaque: `PutBucketCors` returns a bare
+`AccessDenied` while uploads, listing and even `put-object-acl` keep working.
+CORS is a bucket *sub-resource*, and per OVH's own documentation only the account
+that created a resource has full control over its sub-resources. ACLs cannot
+express it either — they offer only READ, WRITE, READ_ACP and FULL_CONTROL, none
+of which is a CORS permission. The pipeline user reaches its objects through a
+role and holds no ACL grant on the bucket at all, so that path can never set
+CORS. Use the owner's credentials, or attach a user policy granting `s3:*`.
+
+Verify from outside, since a bucket that works under `curl` can still be
+unreadable in a browser — `curl` does not enforce CORS:
+
+```sh
+curl -sD- -o /dev/null -X OPTIONS -H "Origin: https://timefli.es" \
+     -H "Access-Control-Request-Method: GET" \
+     -H "Access-Control-Request-Headers: range" \
+     "https://<bucket>.s3.<region>.io.cloud.ovh.net/legs/dates.json"
+```
+
+Expect `200` echoing `Access-Control-Allow-Origin` and listing `content-range`
+and `accept-ranges` under `Access-Control-Expose-Headers`. An origin that is not
+on the list should come back with no `Access-Control-Allow-Origin` at all.
+
+## Object ACLs
+
+`RCLONE_CONFIG_R2_ACL` is **`public-read`**, and it has to be. OVH grants
+anonymous access through ACLs and lists bucket policies as "not yet available for
+Object Storage", so there is no `Principal: "*"` policy to fall back on. R2
+served public reads through its `r2.dev` domain and object ACLs played no part,
+which made `private` harmless there and silently fatal here: the first OVH upload
+reported success and every object answered an anonymous GET with 403.
+
+Objects only. The **bucket** keeps a private ACL, because READ at bucket level
+means "list every object" and the frontend never lists — `dates.json` exists so
+it does not have to.
+
+`rclone sync` compares size and checksum, **not ACLs**, so changing this setting
+does not relabel what is already uploaded. Objects written under the old setting
+need a server-side copy onto themselves:
+
+```sh
+aws --profile <owner> s3 cp s3://<bucket>/legs/ s3://<bucket>/legs/ \
+    --recursive --acl public-read --metadata-directive REPLACE \
+    --endpoint-url https://s3.<region>.io.cloud.ovh.net
+```
+
+`--metadata-directive REPLACE` is required, not optional: S3 rejects a copy of an
+object onto itself unless something changes.

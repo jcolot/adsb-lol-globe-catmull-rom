@@ -1,0 +1,11 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://timefli.es", "http://localhost:4200"],
+      "AllowedMethods": ["GET", "HEAD"],
+      "AllowedHeaders": ["range", "content-type"],
+      "ExposeHeaders": ["content-length", "content-range", "accept-ranges", "etag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}
