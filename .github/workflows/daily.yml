@@ -1,4 +1,7 @@
 name: daily-trace-pipeline
+# A dated manual run is titled with its date, so backfill.yml can find the run
+# it dispatched; scheduled runs keep the plain name.
+run-name: ${{ inputs.date && format('daily-trace-pipeline {0}', inputs.date) || 'daily-trace-pipeline' }}
 
 on:
   schedule:
@@ -10,9 +13,9 @@ on:
         required: false
         default: ""
       retention_days:
-        description: "Keep the newest N date partitions in R2"
+        description: "Keep the newest N date partitions in the bucket"
         required: false
-        default: "30"
+        default: "60"
 
 permissions:
   contents: read           # gh needs only read access to the (public) source repo
@@ -36,7 +39,9 @@ jobs:
       SRC_DATE: ${{ inputs.date }}
       # A backfill of an OLD day must raise this, or the prune step deletes the
       # very partition the run just uploaded (it keeps the newest N by date).
-      RETENTION_DAYS: ${{ inputs.retention_days || '30' }}
+      # 60, not 30: the 2026-08-16..09-20 days were rebuilt onto the current
+      # schema (backfill.yml), and 30 would prune them again within a week.
+      RETENTION_DAYS: ${{ inputs.retention_days || '60' }}
       HEX_MEMORY: "12GB"     # runner has 16 GB; leave the OS and spill room
       BUNDLE_MEMORY: "12GB"
       # The vector hexbin archive is off: nothing draws it and it cost 115 MB a

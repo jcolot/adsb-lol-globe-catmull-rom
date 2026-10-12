@@ -203,7 +203,7 @@ overnight() {
     python3 "$SCRIPT_DIR/overnight/overnight.py" \
         --airports-tz "$SCRIPT_DIR/airport_tz.csv" \
         --emit-client "$OUT/legs" --date "$date" \
-        --tz-back "${RETENTION_DAYS:-30}" "${table_args[@]}"
+        --tz-back "${RETENTION_DAYS:-60}" "${table_args[@]}"
 
     # the settled table belongs to the PREVIOUS partition, which this run's sync
     # does not touch -- copy, never sync, or the prior day's files are deleted.
@@ -257,7 +257,7 @@ overnight() {
 
 upload() {
     : "${R2_BUCKET:?set R2_BUCKET (Cloudflare R2 bucket name)}"
-    local keep="${RETENTION_DAYS:-30}"
+    local keep="${RETENTION_DAYS:-60}"
     local base="r2:$R2_BUCKET/$R2_PREFIX"
     local date; date="$(data_date)"
     # Only the closing DONE line uses this. It went missing when the date

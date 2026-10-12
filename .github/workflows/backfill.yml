@@ -1,0 +1,110 @@
+name: backfill
+
+# Rebuild a range of past days with the CURRENT pipeline, by dispatching
+# daily.yml once per date and waiting for each before the next.
+#
+# Written to move 2026-08-16..09-20 onto flights_schema 5 (callsign, wheels
+# times, base_ts, dated leg_id, the day bundle) -- those partitions predate most
+# of it and cannot be upgraded in place, since the missing columns come from
+# the raw traces. The upstream releases are still published, so a rebuild is a
+# plain re-run.
+#
+# Strictly one at a time, oldest first:
+#   - each run's overnight phase reads D-1's flights.parquet from the bucket to
+#     splice the midnight boundary, so D-1 must already be rebuilt. Running the
+#     day AFTER the range too (the default end, 09-21) settles the last one.
+#   - daily.yml has one concurrency group, and a new run in a group CANCELS the
+#     one already pending there. Dispatching a batch would silently drop all
+#     but one, and dispatching while the nightly is queued would drop the
+#     nightly. So each step waits for the group to be empty first.
+#
+# The retained window must cover the range, or the prune deletes what was just
+# built -- daily.yml's retention default is 60 for this reason.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First data date, YYYY-MM-DD"
+        required: true
+        default: "2026-08-16"
+      end:
+        description: "Last data date, YYYY-MM-DD (inclusive)"
+        required: true
+        default: "2026-09-21"
+
+permissions:
+  contents: read
+  actions: write           # to dispatch daily.yml and read its runs
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  dates:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.range.outputs.list }}
+    steps:
+      - id: range
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import datetime as dt, json, os
+          a = dt.date.fromisoformat(os.environ["START"])
+          b = dt.date.fromisoformat(os.environ["END"])
+          if b < a:
+              raise SystemExit("end is before start")
+          days = [(a + dt.timedelta(i)).isoformat() for i in range((b - a).days + 1)]
+          print("list=" + json.dumps(days))
+          EOF
+
+  day:
+    needs: dates
+    runs-on: ubuntu-latest
+    # daily.yml's own ceiling is 240 min; leave room to wait for the nightly
+    timeout-minutes: 360
+    strategy:
+      max-parallel: 1        # see the header: concurrent dispatches cancel each other
+      fail-fast: false       # one bad day must not stop the rest
+      matrix:
+        date: ${{ fromJSON(needs.dates.outputs.list) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DATE: ${{ matrix.date }}
+    steps:
+      - name: Rebuild ${{ matrix.date }}
+        run: |
+          set -euo pipefail
+          busy() {
+            gh run list --workflow daily.yml --limit 20 --json status \
+              -q '[.[] | select(.status != "completed")] | length'
+          }
+          # wait for the group to drain -- the nightly included
+          while [ "$(busy)" != "0" ]; do
+            echo "daily.yml busy, waiting"; sleep 60
+          done
+
+          since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          gh workflow run daily.yml -f date="$DATE"
+
+          # find the run just dispatched by its title (daily.yml's run-name)
+          id=""
+          for _ in $(seq 30); do
+            sleep 10
+            id="$(gh run list --workflow daily.yml --event workflow_dispatch \
+                    --limit 20 --json databaseId,displayTitle,createdAt \
+                    -q "[.[] | select(.displayTitle == \"daily-trace-pipeline $DATE\"
+                                      and .createdAt >= \"$since\")][0].databaseId // empty")"
+            [ -n "$id" ] && break
+          done
+          [ -n "$id" ] || { echo "::error::dispatched run for $DATE not found"; exit 1; }
+          echo "run: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$id"
+
+          gh run watch "$id" --interval 60 --exit-status >/dev/null \
+            || { echo "::error title=$DATE failed::$GITHUB_SERVER_URL/$GH_REPO/actions/runs/$id"; exit 1; }
+          echo "$DATE rebuilt"
