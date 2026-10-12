@@ -75,7 +75,13 @@ The date is the *data* date, taken from the release tag.
    before trusting `t_off`/`base_ts`.
 2. **A partition** for a chosen `<DATE>`:
    `https://pub-135f2252a0074f0b9761b0dc93a75fa5.r2.dev/legs/date=<DATE>/airports/airport=<ICAO>/data_0.parquet`
-3. **The leg index** for that day: `.../legs/date=<DATE>/flights.parquet`
+3. **The leg index** (`.../legs/date=<DATE>/flights.parquet`) is **not
+   public**. It is uploaded with a private ACL because only the next night's
+   overnight phase reads it, with credentials. Its wheels times are in the
+   per-airport partitions and its identity columns in the bundle's
+   `legs.parquet`. Older partitions were flipped by the `private-leg-index`
+   workflow; re-run it after any backfill that copies partitions in as
+   public-read. On R2 it stays readable, since `r2.dev` ignores object ACLs.
 4. **The traffic tiles** for that day: `.../legs/date=<DATE>/traffic.pmtiles`
    (plus `traffic.pmtiles.stats.json`)
 5. **The day bundle** for that day: `.../legs/date=<DATE>/` →

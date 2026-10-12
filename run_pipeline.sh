@@ -276,10 +276,23 @@ upload() {
     # FOLLOWING day's run. Without the exclude, re-running or backfilling a day
     # would sync them away as extras and they would not come back until that
     # day's successor ran again.
+    #
+    # flights.parquet is excluded too, and written separately below.
     rclone sync "$OUT/legs" "$base/date=$date" \
         --exclude 'points_legs.parquet' --exclude 'traffic-grid.npz' \
         --exclude 'overnight.parquet' --exclude 'spliced.parquet' \
+        --exclude 'flights.parquet' \
         --checksum --transfers 16 --fast-list --stats-one-line
+
+    # The leg index is a pipeline input, not a published file: the only reader
+    # is the NEXT night's overnight phase, which fetches it with credentials to
+    # splice the midnight boundary. Clients read the per-airport partitions
+    # (which carry its wheels times) and the bundle's legs.parquet instead. So
+    # it goes up private, overriding the remote's public-read. --ignore-times
+    # forces the PUT even when the bytes match, because an unchanged object
+    # keeps whatever ACL it had and a re-run must not leave it public.
+    rclone copyto "$OUT/legs/flights.parquet" "$base/date=$date/flights.parquet" \
+        --s3-acl private --ignore-times --stats-one-line
 
     # prune to the newest $keep date partitions
     mapfile -t dates < <(rclone lsf --dirs-only "$base/" | sed 's#/$##' | grep '^date=' | sort)

@@ -1,0 +1,75 @@
+name: private-leg-index
+
+# One-off: make every date=*/flights.parquet already in the bucket private.
+#
+# The nightly upload now writes the leg index private (see upload() in
+# run_pipeline.sh), but an object keeps the ACL it was written with, so the
+# partitions uploaded before that change still answer anonymous GETs. This
+# flips their ACL in place -- no bytes are rewritten. It is idempotent: re-run
+# it after anything that copies partitions in under public-read, such as an
+# R2 -> OVH backfill.
+#
+# OVH only. The r2.dev domain serves the whole R2 bucket regardless of object
+# ACLs, so there is no per-object way to hide a file there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would change without changing it"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-leg-index
+  cancel-in-progress: false
+
+jobs:
+  acl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUCKET: ${{ vars.R2_BUCKET }}
+      PREFIX: legs
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: eu-west-par
+      ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Set flights.parquet ACLs to private
+        run: |
+          set -euo pipefail
+          mapfile -t keys < <(aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
+              --bucket "$BUCKET" --prefix "$PREFIX/date=" \
+              --query "Contents[?ends_with(Key, '/flights.parquet')].Key" \
+              --output text | tr '\t' '\n' | grep -v '^None$' || true)
+          echo "${#keys[@]} leg indexes under $PREFIX/"
+          (( ${#keys[@]} )) || exit 0
+
+          # anonymous URL of an object, to check from outside what a browser sees
+          host="${ENDPOINT#https://}"
+          url() { echo "https://$BUCKET.$host/$1"; }
+
+          fail=0
+          for k in "${keys[@]}"; do
+            if [ "$DRY_RUN" = "true" ]; then
+              code=$(curl -s -o /dev/null -w '%{http_code}' -I "$(url "$k")")
+              echo "would make private: $k (anonymous HEAD now: $code)"
+              continue
+            fi
+            aws s3api put-object-acl --endpoint-url "$ENDPOINT" \
+                --bucket "$BUCKET" --key "$k" --acl private
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I "$(url "$k")")
+            if [ "$code" = "403" ]; then
+              echo "private: $k"
+            else
+              echo "::error title=Still readable::$k answered an anonymous HEAD with $code after the ACL change"
+              fail=1
+            fi
+          done
+          exit $fail

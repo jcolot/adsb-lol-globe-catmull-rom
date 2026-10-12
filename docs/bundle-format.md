@@ -66,9 +66,11 @@ absolute UTC seconds = t_epoch + t0 / 10
   time. A leg includes its taxi and ramp time and, at each end, half of the
   adjacent turnaround (the first and last leg of the day keep all their ramp
   time), so `t1 - t0` overstates the time airborne.
-  Wheels-off/wheels-on are `t_off`/`t_on` in `flights.parquet`, which are not
-  carried into this table. It is also not the time the aircraft spent in any
-  given cell — that is what the `cells.bin` buckets are for.
+  Wheels-off/wheels-on are `t_off`/`t_on`, which are not carried into this
+  table; clients read them from the per-airport partitions (the day-wide
+  `flights.parquet` they come from is a private pipeline file). It is also
+  not the time the aircraft spent in any given cell — that is what the
+  `cells.bin` buckets are for.
 - **Same timeline everywhere in the bundle.** `t0` here is the same number as
   the `t0` at the head of the leg's `tracks.bin` record, `t1` equals `t0` plus
   the sum of that record's `dt`s, and a `cells.bin` bucket `b` covers
