@@ -42,11 +42,44 @@ single contiguous byte range** in `tracks.bin` — the property the per-airport
 partitions existed to provide, now without needing an airport directory. Legs
 with no `dep` go in a tail bucket ordered by H3 anchor cell.
 
-`t0`/`t1` are **deciseconds from `meta.json`/`t_epoch`** (UTC midnight of the data
-date). This matters: `nodes.parquet` stores `t` relative to each *aircraft's*
-`base_ts`, so raw `t` is not comparable between flights. `build_bundle.py` joins
-`aircraft.parquet` to rebase everything on one epoch — which is why it needs
-`--meta`.
+### `t0` and `t1`
+
+`t0` is the timestamp of the leg's **first node** and `t1` of its **last node**,
+in **deciseconds from `meta.json`/`t_epoch`** (UTC midnight of the data date):
+
+```
+t0 = min(tds)  over the leg's nodes      t1 = max(tds)  over the leg's nodes
+tds = t + base_ts * 10 - t_epoch * 10     (t from points_legs.parquet,
+                                           base_ts from aircraft.parquet)
+absolute UTC seconds = t_epoch + t0 / 10
+```
+
+- **Unit and type.** Integer deciseconds (0.1 s), stored as `uint32`. Both ends
+  are **inclusive**: a node exists at exactly `t0` and at exactly `t1`, so a
+  window `[ds0, ds1]` overlaps the leg iff `t0 <= ds1 && t1 >= ds0`.
+- **Range.** Never negative — the `uint32` cast fails the build rather than
+  wrap, so a node before `t_epoch` is an error, not a value. For a single UTC
+  day both fall in `[0, 864000)`; a bundle stitched from several days runs past
+  864000, so do not clamp to one day — the covered span is
+  `index_buckets * bucket_ds` from `meta.json`.
+- **What span it is.** The **leg envelope** as seen by the nodes, not a flight
+  time. A leg includes its taxi and ramp time and, at each end, half of the
+  adjacent turnaround (the first and last leg of the day keep all their ramp
+  time), so `t1 - t0` overstates the time airborne.
+  Wheels-off/wheels-on are `t_off`/`t_on` in `flights.parquet`, which are not
+  carried into this table. It is also not the time the aircraft spent in any
+  given cell — that is what the `cells.bin` buckets are for.
+- **Same timeline everywhere in the bundle.** `t0` here is the same number as
+  the `t0` at the head of the leg's `tracks.bin` record, `t1` equals `t0` plus
+  the sum of that record's `dt`s, and a `cells.bin` bucket `b` covers
+  `[b * bucket_ds, (b+1) * bucket_ds)` on this timeline. `verify_bundle.py`
+  checks the first two by decoding the record.
+
+The rebase is what makes `t0`/`t1` comparable between legs. `points_legs.parquet`
+stores `t` relative to each *aircraft's* `base_ts`, so raw `t` is not comparable
+between flights; `build_bundle.py` joins `aircraft.parquet` to put every node on
+the one `t_epoch` timeline — which is why it needs `--meta`. Today every aircraft
+in a day happens to share one `base_ts`, but nothing relies on that.
 
 ## `cells.bin` — H3 × time inverted index, shipped whole
 
