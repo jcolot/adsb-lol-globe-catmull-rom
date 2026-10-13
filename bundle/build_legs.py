@@ -11,7 +11,7 @@ Pipeline:
      day at the temporal midpoint between consecutive flights -> one leg each,
      taxi-out + airborne + taxi-in;
   3. departure = nearest airport to the leg's first end-window anchor, arrival =
-     nearest to its last (airports.csv, <=10 km). The anchor is a ground fix when
+     nearest to its last (airports.csv, <=10 km, closed fields excluded). The anchor is a ground fix when
      the window has one, else the window's lowest fix, so airports with thin
      surface coverage still resolve;
   4. stamp the callsign (callsigns.parquet) onto each leg: readsb reports `flight`
@@ -86,6 +86,11 @@ LEG_COLS = "p.*, l.base_ts, l.t_off, l.t_on, l.dep_gnd, l.arr_gnd"
 
 FLIGHT_MIN_KM = 2.0     # an airborne run must span this to count as a flight
 NEAR_KM = 10.0          # max distance from a fix to call it "at" an airport
+# OurAirports keeps closed fields in the file (13k of 86k rows), and nearest-
+# match happily picked them: on 2026-08-16, 7,716 of 117,884 legs ended at one,
+# often a closed heliport or seaplane base inside a live airport's 10 km. A
+# balloonport is not somewhere a transponder-equipped flight departs from.
+SKIP_AIRPORT_TYPES = {"closed", "balloonport"}
 ENDPOINT_FRAC = 0.25    # search this much of the leg at each end for an anchor
 ENDPOINT_MIN_PTS = 5    # ...but always look at at least this many points
 
@@ -119,7 +124,7 @@ def build_airport_index(path):
                 ident = row["ident"]
             except (KeyError, ValueError):
                 continue
-            if not ident:
+            if not ident or row.get("type") in SKIP_AIRPORT_TYPES:
                 continue
             grid.setdefault((round(lat), round(lon)), []).append((lat, lon, ident))
     return grid
@@ -128,7 +133,14 @@ def build_airport_index(path):
 def make_resolver(grid, max_km=NEAR_KM):
     cache = {}
     def resolve(lat, lon):
-        ck = (round(lat, 2), round(lon, 2))
+        # keyed on the EXACT fix. It used to be rounded to 0.01 deg (~1 km), so
+        # the first fix to land in a square decided the airport for every later
+        # one there, so a leg's airport depended on processing order and could
+        # be the one nearest some OTHER fix: resolving 2026-08-16 exactly
+        # changes dep or arr on 4,708 of its 117,884 legs.
+        # Ground fixes repeat exactly (parked, stationary-snapped), so the
+        # exact key keeps most of the hits.
+        ck = (lat, lon)
         if ck in cache:
             return cache[ck]
         best, bd = None, max_km
