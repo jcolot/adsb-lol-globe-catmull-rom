@@ -1,0 +1,66 @@
+name: release-days
+
+# Publish GitHub releases (tag data-<date>) for days that are ALREADY in the
+# bucket, by pulling each partition back down and running the same release
+# phase the nightly runs. For the days built before daily.yml grew its release
+# step; the nightly and backfill.yml publish their own from then on.
+#
+# flights.parquet is not pulled -- the release leaves it out anyway. Re-running
+# a date replaces its assets (--clobber), so this is safe to repeat.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First data date, YYYY-MM-DD"
+        required: true
+      end:
+        description: "Last data date, YYYY-MM-DD (inclusive)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-days
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_PREFIX: legs
+      # same remote as daily.yml; read-only use here
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Other
+      RCLONE_CONFIG_R2_REGION: eu-west-par
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      START: ${{ inputs.start }}
+      END: ${{ inputs.end }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+
+      - name: Publish each day
+        run: |
+          set -euo pipefail
+          d="$START"
+          while [[ ! "$d" > "$END" ]]; do
+            dir="$RUNNER_TEMP/day/date=$d"
+            rm -rf "$RUNNER_TEMP/day"
+            if rclone lsf "r2:$R2_BUCKET/$R2_PREFIX/date=$d/meta.json" | grep -q .; then
+              rclone copy "r2:$R2_BUCKET/$R2_PREFIX/date=$d" "$dir" \
+                  --exclude flights.parquet --transfers 16 --fast-list --stats-one-line
+              RELEASE_DIR="$dir" RELEASE_DATE="$d" bash run_pipeline.sh release
+            else
+              echo "::warning::date=$d has no bundle in the bucket -- skipped"
+            fi
+            d="$(date -u -d "$d +1 day" +%F)"
+          done

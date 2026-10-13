@@ -7,7 +7,8 @@
 #   hexes    -> H3 traffic-density tiles: a raster overview + vector hexbins
 #   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (bundle/build_bundle.py)
 #   overnight-> static overnight-classification artifacts (overnight/overnight.py)
-#   upload   -> rclone sync the legs to Cloudflare R2
+#   upload   -> rclone sync the legs to the bucket (OVH; the remote is still named r2)
+#   release  -> mirror the day as a GitHub release, tag data-<date>
 # Run a single phase (`run_pipeline.sh fit`) or the whole thing (`run_pipeline.sh`
 # / `run_pipeline.sh all`). Phases share state through $WORK (the resolved tag is
 # written to $WORK/TAG), so the CI steps hand off via the persisted workspace.
@@ -401,6 +402,89 @@ PY
     echo "DONE: $tag -> $base/date=$date  (kept ${#kept[@]} day(s), retention $keep)"
 }
 
+# A GitHub release per day, tag data-<date>: a download archive NEXT TO the
+# bucket, not instead of it. Browsers cannot read release assets (no CORS, no
+# range requests), so the frontend stays on the bucket; what releases add is
+# whole-day downloads that outlive the bucket's retention prune, for free.
+#
+# A release holds at most 1000 assets and a day has ~18k per-airport files, so
+# airports/ ships as one airports.tar; everything else at the top of the day
+# directory goes up as-is. Left out: flights.parquet (private, see upload()),
+# and the two build-only files upload() leaves out too.
+#
+# overnight.parquet and spliced.parquet for D-1 only exist after D's overnight
+# phase, so this run also adds them to D-1's release when that release exists.
+#
+# NON-FATAL: the bucket is the primary copy and has already been written by
+# upload(); a failed release must not turn the run red over a mirror.
+#
+# RELEASE_DIR / RELEASE_DATE let release-days.yml publish a day pulled back
+# from the bucket instead of one just built.
+release() {
+    local repo="${RELEASE_REPO:-${GITHUB_REPOSITORY:-}}"
+    [ -n "$repo" ] || { echo "no RELEASE_REPO / GITHUB_REPOSITORY -- skipping release"; return 0; }
+    local dir="${RELEASE_DIR:-$OUT/legs}"
+    local date; date="${RELEASE_DATE:-$(data_date)}"
+    local tag="data-$date"
+    if ! publish_release "$repo" "$dir" "$date" "$tag"; then
+        echo "WARNING: release $tag was not published" >&2
+        if [ -n "${GITHUB_ACTIONS:-}" ]; then
+            echo "::warning title=Release failed::$tag was not published - the bucket partition is complete, only the GitHub download archive is missing"
+        fi
+    fi
+
+    # D-1's settled overnight files, written by this run (see overnight())
+    [ -z "${RELEASE_DIR:-}" ] || return 0
+    local prev; prev="$(date -u -d "$date -1 day" +%F 2>/dev/null \
+                        || date -u -j -v-1d -f %F "$date" +%F)"
+    local extra=()
+    for f in overnight.parquet spliced.parquet; do
+        if [ -s "$WORK/overnight/$f" ]; then extra+=("$WORK/overnight/$f"); fi
+    done
+    if (( ${#extra[@]} )) && gh release view "data-$prev" -R "$repo" >/dev/null 2>&1; then
+        gh release upload "data-$prev" "${extra[@]}" -R "$repo" --clobber \
+            && echo "settled overnight files -> release data-$prev" \
+            || echo "WARNING: could not add overnight files to data-$prev" >&2
+    fi
+    return 0
+}
+
+publish_release() {
+    local repo="$1" dir="$2" date="$3" tag="$4"
+    local stage; stage="$(mktemp -d)"
+    local assets=()
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in
+            flights.parquet|points_legs.parquet|traffic-grid.npz) continue ;;
+        esac
+        assets+=("$f")
+    done
+    if [ -d "$dir/airports" ]; then
+        tar -C "$dir" -cf "$stage/airports.tar" airports || return 1
+        assets+=("$stage/airports.tar")
+    fi
+    (( ${#assets[@]} )) || { echo "nothing to release in $dir" >&2; return 1; }
+
+    local base="https://${R2_BUCKET:-adsb-lol-globe-catmull-rom}.s3.eu-west-par.io.cloud.ovh.net/${R2_PREFIX}/date=$date"
+    local notes="ADS-B legs for $date (UTC), built from the adsb.lol globe_history
+release by this repository's pipeline. Format: docs/bundle-format.md.
+
+airports.tar unpacks to airports/airport=<ICAO>/data_0.parquet. The same files
+are served range-readable from the bucket while the day is within retention:
+$base/"
+    if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
+        gh release edit "$tag" -R "$repo" --notes "$notes" >/dev/null || return 1
+    else
+        gh release create "$tag" -R "$repo" --title "Legs $date" --notes "$notes" \
+            --latest=false || return 1
+    fi
+    # --clobber: a re-run replaces the assets rather than failing on them
+    gh release upload "$tag" "${assets[@]}" -R "$repo" --clobber || return 1
+    rm -rf "$stage"
+    echo "release $tag: ${#assets[@]} asset(s)"
+}
+
 case "${1:-all}" in
     resolve) resolve ;;
     fetch)   fetch ;;
@@ -410,6 +494,7 @@ case "${1:-all}" in
     bundle)  bundle ;;
     overnight) overnight ;;
     upload)  upload ;;
-    all)     resolve; fetch; fit; legs; hexes; bundle; overnight; upload ;;
-    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|bundle|upload|all]" >&2; exit 2 ;;
+    release) release ;;
+    all)     resolve; fetch; fit; legs; hexes; bundle; overnight; upload; release ;;
+    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|bundle|overnight|upload|release|all]" >&2; exit 2 ;;
 esac

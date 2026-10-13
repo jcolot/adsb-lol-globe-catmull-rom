@@ -18,7 +18,7 @@ on:
         default: "60"
 
 permissions:
-  contents: read           # gh needs only read access to the (public) source repo
+  contents: write          # to publish the day as a release (data-<date>)
 
 concurrency:
   group: daily-trace-pipeline
@@ -146,3 +146,8 @@ jobs:
 
       - name: Upload to R2
         run: bash run_pipeline.sh upload
+
+      # After the upload, never before: the bucket is the primary copy, and this
+      # step is a mirror that warns rather than fails.
+      - name: Publish GitHub release
+        run: bash run_pipeline.sh release
