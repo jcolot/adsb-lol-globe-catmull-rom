@@ -1,7 +1,7 @@
 numpy
 pmtiles
 pyarrow
-duckdb
+duckdb>=2,<3      # 2.0 removed fetch_record_batch and broke every nightly from 2026-10-22; take majors on purpose
 # only so DuckDB can materialise the TIMESTAMPTZ OOOI columns as Python
 # datetimes in ad-hoc queries; the pipeline itself reads them via epoch_ms()
 pytz

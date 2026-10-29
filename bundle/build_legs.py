@@ -374,9 +374,11 @@ def main():
     lim = f"WHERE icao IN (SELECT DISTINCT icao FROM '{a.traces}' LIMIT {a.limit_aircraft})" \
           if a.limit_aircraft else ""
     sel = "icao,t,lat,lon,alt,on_ground" + (",cusp" if has_cusp else "")
-    reader = con.execute(
-        f"SELECT {sel} FROM '{a.traces}' {lim} "
-        f"ORDER BY icao, t").fetch_record_batch(rows_per_batch=1_000_000)
+    # duckdb 2.0 removed fetch_record_batch (every nightly from 2026-10-22 died
+    # here, since requirements.txt does not pin it); to_arrow_reader replaces it.
+    rel = con.sql(f"SELECT {sel} FROM '{a.traces}' {lim} ORDER BY icao, t")
+    reader = (rel.to_arrow_reader(1_000_000) if hasattr(rel, "to_arrow_reader")
+              else rel.fetch_record_batch(1_000_000))
 
     cur = None
     ts = la = lo = al = gd = cu = None
