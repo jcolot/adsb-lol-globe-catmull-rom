@@ -126,6 +126,9 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
     # file has no such column. Treat it as NULL rather than failing: the bundle
     # is still perfectly usable without it.
     flight_expr = "p.flight" if "flight" in pcols else "NULL::VARCHAR AS flight"
+    # and dep_src/arr_src at FLIGHTS_SCHEMA 6 (where a filled dep/arr came from)
+    src_expr = ("p.dep_src, p.arr_src" if "dep_src" in pcols else
+                "NULL::VARCHAR AS dep_src, NULL::VARCHAR AS arr_src")
     mcols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM '{meta}'").fetchall()}
     if "base_ts" not in mcols:
         sys.exit(f"{meta} has no base_ts column -- need aircraft.parquet from fit_spline.py")
@@ -134,6 +137,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
         CREATE OR REPLACE TABLE leg AS
         WITH n AS (
             SELECT p.leg_id, p.icao, p.dep, p.arr, p.reg, p.type, {flight_expr},
+                   {src_expr},
                    p.lat, p.lon, p.alt, p.t,
                    -- rebase per-aircraft t onto one epoch
                    (p.t::BIGINT + m.base_ts::BIGINT * 10 - {epoch_ds}) AS tds,
@@ -147,6 +151,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                    -- the callsign is stamped per leg by build_legs, so every
                    -- node of a leg carries the same value
                    any_value(flight) AS flight,
+                   any_value(dep_src) AS dep_src, any_value(arr_src) AS arr_src,
                    count(*)::INTEGER AS n_nodes,
                    -- constant within a leg (one leg is one aircraft); lets the
                    -- densifier's per-aircraft t be rebased with a single join
@@ -165,7 +170,7 @@ def build_leg_table(con, points, meta, index_res, epoch_ds):
                     ORDER BY (dep IS NULL), coalesce(dep, ''),
                              CASE WHEN dep IS NULL THEN anchor ELSE 0::UBIGINT END,
                              t0, leg_id) - 1)::INTEGER AS lid,
-               leg_id, icao, dep, arr, reg, type, flight, n_nodes,
+               leg_id, icao, dep, arr, reg, type, flight, dep_src, arr_src, n_nodes,
                t0::BIGINT AS t0, t1::BIGINT AS t1, t_shift,
                min_lat, max_lat, min_lon, max_lon, min_alt, max_alt, anchor
         FROM agg
@@ -564,6 +569,12 @@ def write_legs(con, path, off, ln):
     t = _arrow(t)
     t = t.append_column("off", pa.array(off, pa.uint64()))
     t = t.append_column("len", pa.array(ln, pa.uint32()))
+    # appended LAST, after off/len, so a reader that addresses columns by
+    # position keeps working; 'ground' | 'air' observed, 'chain' | 'route'
+    # filled (bundle/routes.py), NULL unknown
+    src = _arrow(con.execute("SELECT dep_src, arr_src FROM leg ORDER BY lid"))
+    t = t.append_column("dep_src", src.column("dep_src"))
+    t = t.append_column("arr_src", src.column("arr_src"))
     schema = pa.schema([
         ("lid", pa.uint32()), ("icao", pa.string()), ("leg_id", pa.string()),
         ("reg", pa.string()), ("type", pa.string()),
@@ -573,11 +584,13 @@ def write_legs(con, path, off, ln):
         ("min_lat", pa.int32()), ("max_lat", pa.int32()),
         ("min_lon", pa.int32()), ("max_lon", pa.int32()),
         ("min_alt", pa.int32()), ("max_alt", pa.int32()),
-        ("off", pa.uint64()), ("len", pa.uint32())])
+        ("off", pa.uint64()), ("len", pa.uint32()),
+        ("dep_src", pa.string()), ("arr_src", pa.string())])
     t = t.cast(schema)
     pq.write_table(
         t, path, compression="zstd", version="2.6",
-        use_dictionary=["icao", "reg", "type", "flight", "dep", "arr"],
+        use_dictionary=["icao", "reg", "type", "flight", "dep", "arr",
+                        "dep_src", "arr_src"],
         # off/t0 are monotonic in row order and the bboxes correlate with the
         # (dep, t0) sort, so delta packing earns its keep on all of these
         column_encoding={c: "DELTA_BINARY_PACKED" for c in

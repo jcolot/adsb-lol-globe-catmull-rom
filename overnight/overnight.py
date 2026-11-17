@@ -151,6 +151,14 @@ def load_legs(path, require_ground=True):
                  f"there is no usable fallback here)")
     where = ("WHERE dep IS NOT NULL AND arr IS NOT NULL AND dep <> arr "
              "AND base_ts IS NOT NULL AND t_on > t_off")
+    # Timing needs OBSERVED ends. From flights_schema 6 a dep/arr may be filled
+    # from the next leg or a callsign route (dep_src/arr_src 'chain' | 'route'),
+    # and its t_off/t_on is then a cruise fix, not a wheels event. The ground
+    # filter already excludes them (a filled end is never *_gnd); this keeps
+    # require_ground=False honest too.
+    for end in ("dep", "arr"):
+        if f"{end}_src" in cols:
+            where += f" AND {end}_src IN ('ground', 'air')"
     if require_ground:
         where += " AND dep_gnd AND arr_gnd"
     return con.execute(f"""

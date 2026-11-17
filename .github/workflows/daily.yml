@@ -129,6 +129,9 @@ jobs:
       - name: Fit spline nodes
         run: bash run_pipeline.sh fit
 
+      - name: Fetch callsign routes (VRS, as of the data date)
+        run: bash run_pipeline.sh routes
+
       - name: Build per-airport legs
         run: bash run_pipeline.sh legs
 

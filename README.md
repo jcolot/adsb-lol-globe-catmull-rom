@@ -30,7 +30,9 @@ hour?" with **zero further requests**, then one HTTP range read per track drawn.
    placement.
 2. **`bundle/build_legs.py`** — `nodes.parquet → legs/` (per-airport partitions +
    `flights.parquet` index), stamping the callsign from `callsigns.parquet` onto
-   each leg.
+   each leg, cutting legs at unseen turnarounds, and filling ends the trace never
+   saw from the aircraft's adjacent leg or its VRS callsign route
+   (`bundle/routes.py`; the `routes` phase fetches VRS as of the data date).
 3. **`raster/build_hexes.py`** — `points_legs.parquet → traffic-raster.pmtiles` (H3
    traffic density as a raster overview; `hex_raster.py` renders it). The vector
    hexbin archive is optional and **off by default** — see [docs/h3-tiles.md](docs/h3-tiles.md).
@@ -70,6 +72,7 @@ install and no `PYTHONPATH` to set.
 | `cusp` | bool | **break the spline here** (taxi corner / ground↔air) |
 | `leg_id` | string | `{date}_{icao}_{k}` — unique across partitions, not just within one (schema 4+; older days are `{icao}_{k}`) |
 | `dep`, `arr`, `reg`, `type`, `flight` | | leg / aircraft metadata; `flight` is the callsign (schema 5+, NULLable) |
+| `dep_src`, `arr_src` | string | where `dep`/`arr` came from: `ground`/`air` observed, `chain`/`route` filled, NULL unknown (schema 6+) |
 | `base_ts` | int64 | **absolute UTC seconds = `base_ts + t/10`.** `t` alone is relative and not comparable between aircraft |
 | `t_off`, `t_on` | int64 | that leg's wheels-off / wheels-on, same units as `t`. Filter time on these, not on the first and last node — the node span includes taxi and ramp |
 | `dep_gnd`, `arr_gnd` | bool | false means that end never emitted a surface message, so the airport and the wheels time there are approximations |
@@ -103,7 +106,7 @@ extension on first run, so that step needs network access. `--no-tiles` stops
 after the per-resolution `.geojsonl` files if you only want the aggregation.
 
 `run_pipeline.sh` does the whole daily job end-to-end (resolve latest release →
-stream-extract → fit → legs → hexes → bundle → upload to R2). It streams the ~4 GB split-tar
+stream-extract → fit → routes → legs → hexes → bundle → upload to R2). It streams the ~4 GB split-tar
 download straight into `tar`, so peak disk is just the ~2.9 GB extracted tree.
 
 ## Documentation

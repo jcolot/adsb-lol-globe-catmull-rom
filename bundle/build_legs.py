@@ -62,7 +62,7 @@ that, and a client should read base_ts rather than assume it.
 Usage:  ./build_legs.py [--limit-aircraft N] [--traces PATH] [--meta PATH]
                         [--airports CSV] [--out-dir DIR]
 """
-import argparse, datetime as dt, json, math, os, csv as csvmod
+import argparse, datetime as dt, importlib.util, json, math, os, csv as csvmod
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -76,7 +76,12 @@ import pyarrow.parquet as pq
 #   4  leg_id is "<date>_<icao>_<k>" -- globally unique, not just within a day
 #   5  + flight, the callsign, on both (NULLable: readsb reports it only on
 #      change, so absence is not evidence of a callsign-less flight)
-FLIGHTS_SCHEMA = 5
+#   6  dep/arr may be FILLED where the trace never saw that end (routes.py):
+#      + dep_src, arr_src on both ('ground' | 'air' observed, 'chain' | 'route'
+#      filled, NULL unknown) and + route on flights.parquet. A filled end has
+#      no timing of its own -- measure flight times on observed ends only.
+#      Legs are also cut at unseen turnarounds (GAP_SLACK_MIN).
+FLIGHTS_SCHEMA = 6
 
 # What each per-airport row carries beyond the point itself. All five are
 # constant across a leg's run of rows, so RLE reduces them to a few bytes per
@@ -84,6 +89,8 @@ FLIGHTS_SCHEMA = 5
 # file from "the geometry" into "the answer", with no second fetch of the
 # day-wide index to find out when the wheels came up.
 LEG_COLS = "p.*, l.base_ts, l.t_off, l.t_on, l.dep_gnd, l.arr_gnd"
+# dep_src / arr_src ride along in points_legs (p.*) already, so the per-airport
+# files carry them without a join; `route` stays in flights.parquet only.
 
 FLIGHT_MIN_KM = 2.0     # an airborne run must span this to count as a flight
 # An airborne run is also CUT where a landing fits in a gap between two
@@ -124,6 +131,29 @@ ANCHOR_MAX_AGL_FT = 8000.0
 # often a closed heliport or seaplane base inside a live airport's 10 km. A
 # balloonport is not somewhere a transponder-equipped flight departs from.
 SKIP_AIRPORT_TYPES = {"closed", "balloonport"}
+# Fields that share a site with a scheduled airport ("shadow" fields): Melsbroek
+# Air Base (EBMB) sits on Brussels Airport's (EBBR) own runways 1.4 km from its
+# reference point, and heliports ring KIAH, KLAX, KSFO, WMKK, RPLL within 1-3
+# km. Nearest-reference-point matching handed them airliner ends: on
+# 2026-11-15, 9,078 ends were at a field within 5 km of a scheduled large or
+# medium airport, 3,915 of them by airliner types, and they caused 1,561 of
+# the 6,764 route contradictions in routes.py. Two rules, both needing to know
+# WHAT is flying (the aircraft's species from VRS model-type, and whether the
+# callsign is an airline's):
+#   - a landplane (or gyroplane) cannot end at a heliport or a seaplane base,
+#     an amphibian not at a heliport. Helicopters and tiltrotors can use anything.
+#   - an AIRLINE callsign -- its VRS airline row has an IATA code, which no
+#     air force has (BAF, CNV, ACW are in the same table without one) -- takes
+#     the scheduled large/medium airport over a non-scheduled field when the
+#     two are co-sited: the scheduled one within SITE_KM of the nearest
+#     candidate. So BEL lands at EBBR, while a Belgian Air Force C-130 at the
+#     same spot still resolves to EBMB.
+# An unknown type or callsign keeps plain nearest-match.
+SITE_KM = 5.0
+NO_FIELD_FOR = {"L": {"heliport", "seaplane_base"},     # landplane
+                "G": {"heliport", "seaplane_base"},     # gyroplane
+                "A": {"heliport"}}                      # amphibian
+SCHEDULED_TYPES = {"large_airport", "medium_airport"}
 ENDPOINT_FRAC = 0.25    # search this much of the leg at each end for an anchor
 ENDPOINT_MIN_PTS = 5    # ...but always look at at least this many points
 
@@ -163,17 +193,21 @@ def build_airport_index(path):
                 elev = float(row.get("elevation_ft") or 0.0)
             except ValueError:
                 elev = 0.0              # unknown: sea level, i.e. the strict side
+            sched = (row.get("scheduled_service") == "yes"
+                     and row.get("type") in SCHEDULED_TYPES)
             grid.setdefault((round(lat), round(lon)), []).append(
-                (lat, lon, ident, elev))
+                (lat, lon, ident, elev, row.get("type"), sched))
     return grid
 
 
 def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
     cache = {}
-    def resolve(lat, lon, alt=None):
+    def resolve(lat, lon, alt=None, species=None, airline=False):
         """Nearest airport within max_km. `alt` (ft) is given for an AIRBORNE
         anchor only, and then a field the fix is more than max_agl_ft above is
-        not a candidate -- see ANCHOR_MAX_AGL_FT. Ground anchors pass None."""
+        not a candidate -- see ANCHOR_MAX_AGL_FT. Ground anchors pass None.
+        `species` (VRS SpeciesCode) and `airline` apply the shadow-field rules
+        at SITE_KM; both default to plain nearest-match."""
         # keyed on the EXACT fix. It used to be rounded to 0.01 deg (~1 km), so
         # the first fix to land in a square decided the airport for every later
         # one there, so a leg's airport depended on processing order and could
@@ -181,19 +215,31 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
         # changes dep or arr on 4,708 of its 117,884 legs.
         # Ground fixes repeat exactly (parked, stationary-snapped), so the
         # exact key keeps most of the hits.
-        ck = (lat, lon, alt)
+        ck = (lat, lon, alt, species, airline)
         if ck in cache:
             return cache[ck]
-        best, bd = None, max_km
+        excl = NO_FIELD_FOR.get(species, ())
+        cand = []
         rl, ro = round(lat), round(lon)
         for dla in (-1, 0, 1):
             for dlo in (-1, 0, 1):
-                for (alat, alon, ident, elev) in grid.get((rl + dla, ro + dlo), ()):
+                for (alat, alon, ident, elev, atype, sched) in grid.get((rl + dla, ro + dlo), ()):
                     if alt is not None and alt - elev > max_agl_ft:
                         continue
+                    if atype in excl:
+                        continue
                     d = _km(lat, lon, alat, alon)
-                    if d < bd:
-                        bd, best = d, ident
+                    if d < max_km:
+                        cand.append((d, ident, sched, alat, alon))
+        best = None
+        if cand:
+            cand.sort()
+            best = cand[0][1]
+            if airline and not cand[0][2]:
+                n_la, n_lo = cand[0][3], cand[0][4]
+                site = [c for c in cand if c[2] and _km(n_la, n_lo, c[3], c[4]) <= SITE_KM]
+                if site:
+                    best = site[0][1]           # nearest co-sited scheduled airport
         cache[ck] = best
         return best
     return resolve
@@ -303,7 +349,7 @@ def _anchor(al, gnd, idxs, head):
     return min(idxs, key=lambda i: al[i]), False
 
 
-def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
+def endpoint_airport(la, lo, al, gnd, i0, i1, resolve, species=None, airline=False):
     """Nearest airport to each TEMPORAL end of the leg.
 
     The two windows are disjoint by construction, and that is what keeps a leg
@@ -319,9 +365,9 @@ def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
     dep_i, dep_gnd = _anchor(al, gnd, range(i0, i0 + w), True)
     arr_i, arr_gnd = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
     dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5,
-                  None if dep_gnd else al[dep_i])
+                  None if dep_gnd else al[dep_i], species, airline)
     arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5,
-                  None if arr_gnd else al[arr_i])
+                  None if arr_gnd else al[arr_i], species, airline)
     return dep, arr, dep_gnd, arr_gnd
 
 
@@ -383,6 +429,11 @@ def main():
                     help="the UTC date this archive covers; it goes into every "
                          "leg_id. Derived from the aircraft table's base_ts "
                          "when omitted")
+    ap.add_argument("--routes", default=None, metavar="DIR",
+                    help="VRS standing-data checkout (routes/ + airlines/, and a "
+                         "COMMIT file naming its revision) to fill unseen leg "
+                         "ends from callsign routes; without it only the "
+                         "same-aircraft chain fill runs. See routes.py")
     ap.add_argument("--limit-aircraft", type=int, default=0)
     ap.add_argument("--airport-radius-km", dest="airport_radius", type=float,
                     default=0.0, help="if > 0, per-airport files keep only the "
@@ -409,9 +460,20 @@ def main():
         meta = {r[0]: (r[1], r[2], None) for r in con.execute(
             f"SELECT icao, reg, type FROM '{a.meta}'").fetchall()}
     day = resolve_date(a.date, meta)
-    resolve = make_resolver(build_airport_index(a.airports))
+    grid = build_airport_index(a.airports)
+    resolve = make_resolver(grid)
+    coords = {ident: (c[0], c[1]) for cell in grid.values() for c in cell
+              for ident in (c[2],)}
     os.makedirs(a.out_dir, exist_ok=True)
     cs_by = load_callsigns(con, a.callsigns)
+    rspec = importlib.util.spec_from_file_location(
+        "routes", os.path.join(os.path.dirname(os.path.abspath(__file__)), "routes.py"))
+    rt = importlib.util.module_from_spec(rspec); rspec.loader.exec_module(rt)
+    routes = rt.Routes(a.routes) if a.routes else None
+    if routes:
+        print(f"  routes: {len(routes.by_cs):,} callsigns from {a.routes} "
+              f"(commit {routes.commit or 'unknown'})")
+    fill_st = rt.new_stats()
 
     # carry the cusp bit through if the source has one (CR-fit output); the
     # frontend breaks its Catmull-Rom spline at cusp nodes for sharp corners
@@ -420,7 +482,7 @@ def main():
     has_cusp = "cusp" in src_cols
 
     pcols = ["icao", "t", "lat", "lon", "alt", "on_ground", "leg_id", "dep", "arr",
-             "reg", "type", "flight"] + (["cusp"] if has_cusp else [])
+             "reg", "type", "flight", "dep_src", "arr_src"] + (["cusp"] if has_cusp else [])
     pbuf = {c: [] for c in pcols}
     legs_rows = []
     pw = [None]
@@ -428,7 +490,8 @@ def main():
                ("lon", pa.int32()), ("alt", pa.int32()), ("on_ground", pa.bool_()),
                ("leg_id", pa.string()), ("dep", pa.string()), ("arr", pa.string()),
                ("reg", pa.string()), ("type", pa.string()),
-               ("flight", pa.string())]
+               ("flight", pa.string()),
+               ("dep_src", pa.string()), ("arr_src", pa.string())]
     if has_cusp:
         pfields.append(("cusp", pa.bool_()))
     pschema = pa.schema(pfields)
@@ -440,7 +503,8 @@ def main():
         if pw[0] is None:
             pw[0] = pq.ParquetWriter(pl_path, pschema, compression="zstd",
                                      use_dictionary=["icao", "leg_id", "dep", "arr",
-                                                     "reg", "type", "flight"])
+                                                     "reg", "type", "flight",
+                                                     "dep_src", "arr_src"])
         pw[0].write_table(pa.table(pbuf, schema=pschema))
         for c in pcols:
             pbuf[c] = []
@@ -464,9 +528,9 @@ def main():
         if not legs:
             return 0
         reg, typ, base = meta.get(icao, (None, None, None))
+        recs = []
+        species = routes.species.get(typ) if routes and typ else None
         for k, (i0, i1) in enumerate(legs):
-            dep, arr, dep_gnd, arr_gnd = endpoint_airport(
-                la, lo, al, gd, i0, i1, resolve)
             # t_start/t_end bracket the LEG (half of each adjacent turnaround,
             # and all of the ramp time on the day's first and last leg), so
             # t_end - t_start is not a flight time. t_off/t_on bracket the
@@ -484,19 +548,39 @@ def main():
             flight = (flight_for_leg(changes, base + ts[i0] / 10.0,
                                      base + ts[i1] / 10.0, base + t_on / 10.0)
                       if changes else None)
-            leg_id = f"{day}_{icao}_{k}"
+            # resolved AFTER the callsign: who is flying decides which of two
+            # co-sited fields an end belongs to (SITE_KM)
+            dep, arr, dep_gnd, arr_gnd = endpoint_airport(
+                la, lo, al, gd, i0, i1, resolve, species,
+                bool(routes and routes.is_airline(flight)))
+            # off_s/on_s only need to be comparable WITHIN this aircraft, so a
+            # missing base_ts can fall back to 0 for the fill's reachability test
+            b0 = base or 0
+            recs.append(dict(k=k, i0=i0, i1=i1, dep=dep, arr=arr, dep_gnd=dep_gnd,
+                             arr_gnd=arr_gnd, flight=flight, t_off=t_off, t_on=t_on,
+                             off_s=b0 + t_off / 10.0, on_s=b0 + t_on / 10.0,
+                             f0=(la[s_air] / 1e5, lo[s_air] / 1e5),
+                             f1=(la[e_air] / 1e5, lo[e_air] / 1e5)))
+        # unseen ends: same-aircraft chain, then callsign routes -- routes.py
+        rt.fill_aircraft(recs, coords, routes, fill_st)
+        for r in recs:
+            i0, i1 = r["i0"], r["i1"]
+            leg_id = f"{day}_{icao}_{r['k']}"
             for idx in range(i0, i1 + 1):
                 pbuf["icao"].append(icao); pbuf["t"].append(ts[idx])
                 pbuf["lat"].append(la[idx]); pbuf["lon"].append(lo[idx])
                 pbuf["alt"].append(al[idx]); pbuf["on_ground"].append(gd[idx])
-                pbuf["leg_id"].append(leg_id); pbuf["dep"].append(dep); pbuf["arr"].append(arr)
+                pbuf["leg_id"].append(leg_id)
+                pbuf["dep"].append(r["dep"]); pbuf["arr"].append(r["arr"])
                 pbuf["reg"].append(reg); pbuf["type"].append(typ)
-                pbuf["flight"].append(flight)
+                pbuf["flight"].append(r["flight"])
+                pbuf["dep_src"].append(r["dep_src"]); pbuf["arr_src"].append(r["arr_src"])
                 if has_cusp:
                     pbuf["cusp"].append(cu[idx])
-            legs_rows.append((leg_id, icao, reg, typ, flight, dep, arr,
-                              ts[i0], ts[i1], t_off, t_on,
-                              dep_gnd, arr_gnd, base, i1 - i0 + 1))
+            legs_rows.append((leg_id, icao, reg, typ, r["flight"], r["dep"], r["arr"],
+                              ts[i0], ts[i1], r["t_off"], r["t_on"],
+                              r["dep_gnd"], r["arr_gnd"], base, i1 - i0 + 1,
+                              r["dep_src"], r["arr_src"], r["route"]))
         return len(legs)
 
     for batch in reader:
@@ -538,9 +622,13 @@ def main():
         "dep_gnd": [x[11] for x in legs_rows], "arr_gnd": [x[12] for x in legs_rows],
         "base_ts": [x[13] for x in legs_rows],
         "n_points": [x[14] for x in legs_rows],
+        "dep_src": pa.array([x[15] for x in legs_rows], pa.string()),
+        "arr_src": pa.array([x[16] for x in legs_rows], pa.string()),
+        "route": pa.array([x[17] for x in legs_rows], pa.string()),
     }).sort_by("dep")
     pq.write_table(lt, os.path.join(a.out_dir, "flights.parquet"),
-                   compression="zstd", use_dictionary=["dep", "arr", "type", "reg", "flight"])
+                   compression="zstd", use_dictionary=["dep", "arr", "type", "reg", "flight",
+                                                       "dep_src", "arr_src", "route"])
     # joined into every per-airport file below, so one fetch carries both the
     # geometry and the five per-leg values a time query needs
     con.register("legidx", lt)
@@ -606,7 +694,10 @@ def main():
     # goes up whenever a column is added or changes meaning -- days written
     # before this file existed have no legs_meta.json at all, which reads as
     # schema 1 (no t_off/t_on, no ground flags, no base_ts).
-    bases = {x[12] for x in legs_rows}
+    # x[13], not x[12]: [12] is arr_gnd, which made this {True, False} -- every
+    # day said base_ts_uniform false, and an all-ground-arrival day would have
+    # reported t_epoch = 1 (1970)
+    bases = {x[13] for x in legs_rows}
     uniform = len(bases) == 1 and None not in bases
     epoch = next(iter(bases)) if uniform else None
     meta_out = {
@@ -620,6 +711,9 @@ def main():
         "t_epoch_iso": (dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
                         .isoformat().replace("+00:00", "Z")) if epoch else None,
         "has_cusp": has_cusp,
+        # where filled dep/arr came from, and how many of each kind
+        "routes_commit": routes.commit if routes else None,
+        "fill": fill_st,
     }
     with open(os.path.join(a.out_dir, "legs_meta.json"), "w") as f:
         json.dump(meta_out, f, indent=1)

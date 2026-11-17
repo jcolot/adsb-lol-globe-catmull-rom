@@ -3,6 +3,7 @@
 #   resolve  -> find the adsblol release tag for the variant (SRC_DATE, else latest)
 #   fetch    -> stream the split-tar assets straight into tar (no 4-6 GB staged)
 #   fit      -> fit sparse Catmull-Rom spline nodes (geometry/fit_spline.py)
+#   routes   -> VRS callsign routes as of the data date (fills unseen leg ends)
 #   legs     -> split into per-airport leg partitions (bundle/build_legs.py)
 #   hexes    -> H3 traffic-density tiles: a raster overview + vector hexbins
 #   bundle   -> legs.parquet + cells.bin + tracks.bin, then verify (bundle/build_bundle.py)
@@ -46,6 +47,8 @@ VERIFY_LEGS="${VERIFY_LEGS:-2000}"     # legs round-trip decoded by the gate
 VERIFY_BOXES="${VERIFY_BOXES:-25}"
 OVN_MAX_GAP_H="${OVN_MAX_GAP_H:-3}"    # splice_legs.py boundary gap tolerance
 TAGFILE="$WORK/TAG"
+ROUTES_REPO="${ROUTES_REPO:-vradarserver/standing-data}"
+ROUTES="${ROUTES:-$WORK/routes}"     # VRS checkout for the routes phase
 
 # The data date lives in the release tag: v2026.07.17-...-prod-0 -> 2026-07-17.
 # Three phases need it (leg_id carries it, the overnight artifacts are keyed on
@@ -108,13 +111,48 @@ fit() {
 # the release tag rather than inferred: build_legs can derive it from base_ts,
 # but the tag is the authority on which archive this is, and an id built from a
 # guess would collide with a real day's.
+# VRS standing-data routes (CC0, github.com/vradarserver/standing-data), pinned
+# to the last commit BEFORE the day after the data date, so a backfill sees the
+# routes as they stood then rather than today's. Sparse + blobless: only
+# routes/, airlines/ and model-type/ (~26 MB) come down; model-type gives each
+# aircraft type's species, which the airport resolver needs (build_legs SITE_KM).
+# The revision goes into $ROUTES/COMMIT
+# and from there into legs_meta.json. Best-effort: on any failure the directory
+# is removed and legs runs with the same-aircraft chain fill only.
+routes() {
+    local date; date="$(data_date)"
+    local until; until="$(python3 -c "import datetime as d,sys; print((d.date.fromisoformat(sys.argv[1])+d.timedelta(days=1)).isoformat())" "$date")"
+    rm -rf "$ROUTES"
+    local sha
+    sha="$(gh api "repos/$ROUTES_REPO/commits?until=${until}T00:00:00Z&per_page=1" \
+            --jq '.[0].sha' 2>/dev/null)" || sha=""
+    if [ -z "$sha" ]; then
+        echo "routes: no $ROUTES_REPO commit before $until -- legs will run without routes" >&2
+        return 0
+    fi
+    if ! { git init -q "$ROUTES" \
+           && git -C "$ROUTES" remote add origin "https://github.com/$ROUTES_REPO.git" \
+           && git -C "$ROUTES" config core.sparseCheckout true \
+           && printf 'routes/schema-01/\nairlines/schema-01/\nmodel-type/schema-01/\n' > "$ROUTES/.git/info/sparse-checkout" \
+           && git -C "$ROUTES" fetch -q --depth 1 --filter=blob:none origin "$sha" \
+           && git -C "$ROUTES" checkout -q FETCH_HEAD; }; then
+        echo "routes: fetch of $sha failed -- legs will run without routes" >&2
+        rm -rf "$ROUTES"; return 0
+    fi
+    echo "$sha" > "$ROUTES/COMMIT"
+    echo "routes: $ROUTES_REPO@${sha:0:7} (last commit before $until)"
+}
+
 legs() {
     local date; date="$(data_date)"
     mkdir -p "$OUT"; rm -rf "$OUT/legs"
+    local rarg=()
+    [ -f "$ROUTES/COMMIT" ] && rarg=(--routes "$ROUTES")
     python3 "$SCRIPT_DIR/bundle/build_legs.py" \
         --traces "$WORK/nodes/nodes.parquet" --date "$date" \
         --meta "$WORK/nodes/aircraft.parquet" \
-        --callsigns "$WORK/nodes/callsigns.parquet" --out-dir "$OUT/legs"
+        --callsigns "$WORK/nodes/callsigns.parquet" --out-dir "$OUT/legs" \
+        "${rarg[@]}"
 }
 
 # Writes both archives INTO $OUT/legs so the existing upload picks them up with
@@ -490,12 +528,13 @@ case "${1:-all}" in
     resolve) resolve ;;
     fetch)   fetch ;;
     fit)     fit ;;
+    routes)  routes ;;
     legs)    legs ;;
     hexes)   hexes ;;
     bundle)  bundle ;;
     overnight) overnight ;;
     upload)  upload ;;
     release) release ;;
-    all)     resolve; fetch; fit; legs; hexes; bundle; overnight; upload; release ;;
-    *) echo "usage: $0 [resolve|fetch|fit|legs|hexes|bundle|overnight|upload|release|all]" >&2; exit 2 ;;
+    all)     resolve; fetch; fit; routes; legs; hexes; bundle; overnight; upload; release ;;
+    *) echo "usage: $0 [resolve|fetch|fit|routes|legs|hexes|bundle|overnight|upload|release|all]" >&2; exit 2 ;;
 esac

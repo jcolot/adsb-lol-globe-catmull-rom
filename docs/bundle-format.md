@@ -22,8 +22,8 @@ would otherwise force two copies of the geometry.
 
 `lid`, `icao`, `leg_id`, `reg`, `type`, `flight`, `dep`, `arr`, `t0`, `t1`,
 `n_nodes`, the bounding box (`min_lat`…`max_lon`, degrees × 1e5),
-`min_alt`/`max_alt` in feet, and `off`/`len` — the byte range of that leg's
-record in `tracks.bin`.
+`min_alt`/`max_alt` in feet, `off`/`len` — the byte range of that leg's
+record in `tracks.bin` — and, last, `dep_src`/`arr_src` (schema 6+).
 
 `lid` is this file's row index and means nothing outside it; `leg_id` is the
 stable identity that joins to `flights.parquet`, the per-airport partitions and
@@ -33,6 +33,22 @@ stable identity that joins to `flights.parquet`, the per-airport partitions and
 days built before `flights_schema` 5, and NULLable on individual legs after it —
 readsb reports the callsign only on change, so absence is not evidence of a
 callsign-less flight.
+
+`dep_src` / `arr_src` say where each end came from (schema 6+; absent before):
+
+| value | meaning |
+|---|---|
+| `ground` | a surface fix at that end — observed |
+| `air` | resolved from the lowest approach / climb-out fix — observed, approximate |
+| `chain` | not seen; taken from the same aircraft's adjacent leg (it departs where it last landed) |
+| `route` | not seen; taken from the VRS callsign route, and only where the seen end and track agree with it |
+| NULL | unknown |
+
+A `chain` or `route` end names the airport but carries **no time**: `t0`/`t1`
+at that end are still the first/last *seen* fix. Count and label with filled
+ends; measure flight or turnaround times on observed ends only. How the fill
+decides is in `bundle/routes.py`, and `legs_meta.json` records the VRS commit
+used (`routes_commit`) and how many ends each source filled (`fill`).
 
 **`lid` is the row index**, so a posting list from `cells.bin` indexes this table
 directly with no lookup map.

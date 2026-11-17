@@ -56,6 +56,16 @@ Usage:
 import argparse, datetime as dt, glob, os, re, sys
 import duckdb, pyarrow as pa, pyarrow.parquet as pq
 
+
+def _observed(con, path, end):
+    """dep/arr as SEEN: values filled by build_legs (dep_src/arr_src 'chain' or
+    'route', flights_schema 6) masked to NULL. Mirrors bundle/routes.observed_sql;
+    older files have no *_src column and every non-null end was observed."""
+    cols = {c[0] for c in con.execute(f"DESCRIBE SELECT * FROM '{path}'").fetchall()}
+    if f"{end}_src" in cols:
+        return f"(CASE WHEN {end}_src IN ('ground', 'air') THEN {end} END)"
+    return end
+
 from overnight import load_airports, gc_km
 
 MAX_GAP_H = 3.0
@@ -111,9 +121,14 @@ def read_day(con, date, path, max_gap_h=MAX_GAP_H):
                              tzinfo=dt.timezone.utc).timestamp() + 86400) * 10
     beg_ds = end_ds - 86400 * 10
     win = int(max_gap_h * 3600 * 10)
+    # Splice on OBSERVED ends only. From flights_schema 6 build_legs fills an
+    # unseen dep/arr from the aircraft's next leg or its callsign route, and a
+    # filled arr on the day's last leg would hide exactly the tail this exists
+    # to find -- while carrying no wheels-on time to splice with.
     return con.execute(f"""
         WITH l AS (
-            SELECT leg_id, icao, reg, type, dep, arr, dep_gnd, arr_gnd, n_points,
+            SELECT leg_id, icao, reg, type, {_observed(con, path, "dep")} AS dep,
+                   {_observed(con, path, "arr")} AS arr, dep_gnd, arr_gnd, n_points,
                    base_ts * 10 + t_off AS off_ds,
                    base_ts * 10 + t_on  AS on_ds,
                    t_off, t_on, t_start, t_end,
