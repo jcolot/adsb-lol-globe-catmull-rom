@@ -7,9 +7,10 @@ fetch one at a time.
 Pipeline:
   1. read the decimated points (prod-0-parquet-single/traces.parquet), grouped by
      icao and ordered by time;
-  2. find airborne runs that actually go somewhere (>2 km horizontal), split the
-     day at the temporal midpoint between consecutive flights -> one leg each,
-     taxi-out + airborne + taxi-in;
+  2. find airborne runs that actually go somewhere (>2 km horizontal), cutting a
+     run wherever a landing fits in a gap between two airborne nodes (see
+     GAP_SLACK_MIN), and split the day at the temporal midpoint between
+     consecutive flights -> one leg each, taxi-out + airborne + taxi-in;
   3. departure = nearest airport to the leg's first end-window anchor, arrival =
      nearest to its last (airports.csv, <=10 km, closed fields excluded). The anchor is a ground fix when
      the window has one, else the window's lowest fix, so airports with thin
@@ -85,7 +86,39 @@ FLIGHTS_SCHEMA = 5
 LEG_COLS = "p.*, l.base_ts, l.t_off, l.t_on, l.dep_gnd, l.arr_gnd"
 
 FLIGHT_MIN_KM = 2.0     # an airborne run must span this to count as a flight
+# An airborne run is also CUT where a landing fits in a gap between two
+# consecutive airborne nodes: the gap's time minus the time to fly its distance
+# at GAP_KMH is at least GAP_SLACK_MIN. Without this the run is only broken by
+# an on_ground fix, and a field with no surface coverage never produces one, so
+# the flight in and the flight out fuse into one leg. Measured on 2026-11-15:
+# SunExpress EBBR->LTAC->EBBR came out as one 7-8 h leg from EBBR to a German
+# strip, and LTAC had no legs at all.
+#
+# Both values come from the airborne node gaps of 2026-11-15 (10.3M nodes,
+# 92k legs). Gaps up to 20 min are overwhelmingly at cruise speed (normal
+# spline spacing on a straight track); from 40 min they are overwhelmingly
+# under 150 km/h (the aircraft went nowhere). Slack at 700 km/h falls off a
+# cliff in altitude past ~20 min: median lower end 22,400 ft at 0-10 min,
+# 4,800 at 20-30, ~1,700-2,750 from 30 min on -- lost on the approach,
+# reacquired on the climb. 30 min keeps holding and approach shuffles in poor
+# coverage intact and still catches a 25-minute low-cost turn, since the gap
+# then also spans the last minutes of descent and first of climb. 700 km/h is
+# deliberately SLOW for a jet: a lower speed charges more flying time to the
+# gap and so splits less, which keeps a long tailwind crossing of a coverage
+# hole (slack < 0) whole. The rule splits 26,986 of that day's 92,330 legs.
+GAP_SLACK_MIN = 30.0
+GAP_KMH = 700.0
 NEAR_KM = 10.0          # max distance from a fix to call it "at" an airport
+# An AIRBORNE anchor (no surface fix at that end) may name a field only if it is
+# at most this far above the field's elevation. The anchor is the lowest fix in
+# the end-window, and nothing used to check that it was low: on 2026-11-15,
+# 3,535 ends were resolved from fixes at 15,000 ft or more -- an overflight of
+# whatever strip lay within NEAR_KM. The gap split above makes many more ends
+# that stop at cruise, which took that to 5,913. Within 10 km of a runway an
+# arrival is ~3,000 ft up and even a light jet's climb-out is ~6,000, so 8,000
+# keeps every real approach and departure. Relative to elevation, not MSL, or
+# La Paz (13,300 ft) and Lhasa (11,700) would lose every airborne anchor.
+ANCHOR_MAX_AGL_FT = 8000.0
 # OurAirports keeps closed fields in the file (13k of 86k rows), and nearest-
 # match happily picked them: on 2026-08-16, 7,716 of 117,884 legs ended at one,
 # often a closed heliport or seaplane base inside a live airport's 10 km. A
@@ -126,13 +159,21 @@ def build_airport_index(path):
                 continue
             if not ident or row.get("type") in SKIP_AIRPORT_TYPES:
                 continue
-            grid.setdefault((round(lat), round(lon)), []).append((lat, lon, ident))
+            try:
+                elev = float(row.get("elevation_ft") or 0.0)
+            except ValueError:
+                elev = 0.0              # unknown: sea level, i.e. the strict side
+            grid.setdefault((round(lat), round(lon)), []).append(
+                (lat, lon, ident, elev))
     return grid
 
 
-def make_resolver(grid, max_km=NEAR_KM):
+def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
     cache = {}
-    def resolve(lat, lon):
+    def resolve(lat, lon, alt=None):
+        """Nearest airport within max_km. `alt` (ft) is given for an AIRBORNE
+        anchor only, and then a field the fix is more than max_agl_ft above is
+        not a candidate -- see ANCHOR_MAX_AGL_FT. Ground anchors pass None."""
         # keyed on the EXACT fix. It used to be rounded to 0.01 deg (~1 km), so
         # the first fix to land in a square decided the airport for every later
         # one there, so a leg's airport depended on processing order and could
@@ -140,14 +181,16 @@ def make_resolver(grid, max_km=NEAR_KM):
         # changes dep or arr on 4,708 of its 117,884 legs.
         # Ground fixes repeat exactly (parked, stationary-snapped), so the
         # exact key keeps most of the hits.
-        ck = (lat, lon)
+        ck = (lat, lon, alt)
         if ck in cache:
             return cache[ck]
         best, bd = None, max_km
         rl, ro = round(lat), round(lon)
         for dla in (-1, 0, 1):
             for dlo in (-1, 0, 1):
-                for (alat, alon, ident) in grid.get((rl + dla, ro + dlo), ()):
+                for (alat, alon, ident, elev) in grid.get((rl + dla, ro + dlo), ()):
+                    if alt is not None and alt - elev > max_agl_ft:
+                        continue
                     d = _km(lat, lon, alat, alon)
                     if d < bd:
                         bd, best = d, ident
@@ -172,7 +215,7 @@ def segment(ts, la, lo, alt, gnd):
     consecutive airborne runs. Callers want both: legs[k] is the envelope to
     draw, airs[k] is the span to time."""
     n = len(ts)
-    # airborne runs (on_ground == False)
+    # airborne runs (on_ground == False), cut again where a landing fits in a gap
     runs = []
     i = 0
     while i < n:
@@ -180,7 +223,7 @@ def segment(ts, la, lo, alt, gnd):
             j = i
             while j < n and not gnd[j]:
                 j += 1
-            runs.append((i, j - 1))
+            runs.extend(_split_at_gaps(ts, la, lo, i, j - 1))
             i = j
         else:
             i += 1
@@ -211,6 +254,36 @@ def segment(ts, la, lo, alt, gnd):
             leg_of[idx] = k
         legs.append((i0, i1))
     return leg_of, legs, flights
+
+
+def _landing_fits(ts, la, lo, a, b):
+    """Could the aircraft have landed and taken off again between airborne
+    nodes a and b? `ts` is in deciseconds, la/lo are degrees * 1e5. See
+    GAP_SLACK_MIN for where the numbers come from."""
+    dt_min = (ts[b] - ts[a]) / 600.0
+    if dt_min < GAP_SLACK_MIN:
+        return False                    # cheap exit: most node pairs
+    d_km = _km(la[a] / 1e5, lo[a] / 1e5, la[b] / 1e5, lo[b] / 1e5)
+    return dt_min - 60.0 * d_km / GAP_KMH >= GAP_SLACK_MIN
+
+
+def _split_at_gaps(ts, la, lo, s, e):
+    """Airborne run [s, e] cut wherever a landing fits between two nodes.
+
+    Each piece is still filtered by FLIGHT_MIN_KM afterwards, and the leg
+    boundary then falls at the temporal midpoint of the gap like any other
+    turnaround -- so neither leg inherits a straight line across the hole. The
+    two ends either side of a cut never had a surface message, so dep_gnd /
+    arr_gnd come out False there and t_on / t_off are the last and first SEEN
+    airborne fixes, not wheels events."""
+    out = []
+    start = s
+    for k in range(s, e):
+        if _landing_fits(ts, la, lo, k, k + 1):
+            out.append((start, k))
+            start = k + 1
+    out.append((start, e))
+    return out
 
 
 def _anchor(al, gnd, idxs, head):
@@ -245,8 +318,10 @@ def endpoint_airport(la, lo, al, gnd, i0, i1, resolve):
     w = min(w, max(1, n // 2))              # never let head and tail overlap
     dep_i, dep_gnd = _anchor(al, gnd, range(i0, i0 + w), True)
     arr_i, arr_gnd = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
-    dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5)
-    arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5)
+    dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5,
+                  None if dep_gnd else al[dep_i])
+    arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5,
+                  None if arr_gnd else al[arr_i])
     return dep, arr, dep_gnd, arr_gnd
 
 
