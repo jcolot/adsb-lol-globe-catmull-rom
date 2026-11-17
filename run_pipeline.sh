@@ -25,6 +25,7 @@ R2_PREFIX="${R2_PREFIX:-legs}"
 TOL_GROUND="${TOL_GROUND:-2}"
 TOL_CRUISE="${TOL_CRUISE:-150}"
 CORNER="${CORNER:-35}"
+TOL_ALT="${TOL_ALT:-100}"   # ft, altitude miss allowed between nodes
 HEX_MAX_RES="${HEX_MAX_RES:-6}"        # 6 = 3.2 km edge, drawn at z8
 HEX_MIN_RES="${HEX_MIN_RES:-0}"
 HEX_STEP_KM="${HEX_STEP_KM:-1.5}"      # keep <= half the finest hex edge
@@ -100,7 +101,7 @@ fetch() {
 fit() {
     python3 "$SCRIPT_DIR/geometry/fit_spline.py" "$WORK/traces" --ground-elevation \
         --airports "$SCRIPT_DIR/airports.csv" --parquet "$WORK/nodes" \
-        --tol-ground "$TOL_GROUND" --tol-cruise "$TOL_CRUISE" --corner "$CORNER"
+        --tol-ground "$TOL_GROUND" --tol-cruise "$TOL_CRUISE" --tol-alt "$TOL_ALT" --corner "$CORNER"
 }
 
 # --date is what every leg_id is prefixed with, so it is passed explicitly from

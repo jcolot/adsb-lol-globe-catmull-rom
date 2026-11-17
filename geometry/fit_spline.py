@@ -7,7 +7,9 @@ Fit: per phase-segment (split at sharp taxi corners and ground<->air, marked as
 cusps), greedily place interpolation nodes until the centripetal Catmull-Rom curve
 through them -- the exact curve the frontend draws -- stays within a per-point
 tolerance that ramps from --tol-ground (m) on the surface to --tol-cruise (m) up
-high. Only the nodes are stored; no handles or coefficients are needed, because
+high. Altitude is held separately: a raw point also forces a node when it sits more
+than --tol-alt (ft) off the altitude interpolated linearly in time between nodes.
+Only the nodes are stored; no handles or coefficients are needed, because
 the curve is fully determined by the points it passes through (build_nodes_cr).
 
 Output (--parquet DIR): nodes.parquet + aircraft.parquet. Columns t (deciseconds
@@ -46,6 +48,10 @@ Q_POS = 1e5            # deg quantum (~1.1 m lat)
 GC_MAX_GAP_KM = float(os.environ.get("GC_MAX_GAP_KM", "200"))
 Q_HAND = 0.5           # handle quantum, metres
 Q_ALT = 25            # ft
+# Vertical tolerance (ft). The CR curve is 2-D, so without this a dive or climb on
+# a straight track keeps almost no nodes and its altitude profile is lost (N722BD,
+# 2026-11-01: 1,214 ft off at the pushover). 100 ft is four ADS-B altitude quanta.
+TOL_ALT_FT = 100.0
 
 # ---------------- vector ops ----------------
 def sub(a, b): return (a[0]-b[0], a[1]-b[1])
@@ -160,7 +166,7 @@ def cr_polyline(P, sub=12):
     out.append(P[-1])
     return out
 
-def _span_worst(P, TL, ctrl, L, R, sub):
+def _span_worst(P, TL, ctrl, L, R, sub, vert=None):
     """Worst (dist-tol) of raw points strictly between kept nodes L and R, measured
     against ONLY this span's centripetal-CR curve. `ctrl`=(P0,P1,P2,P3) are the four
     control points (P1=P[L], P2=P[R]; P0/P3 the neighbour nodes). Vectorized over
@@ -181,12 +187,25 @@ def _span_worst(P, TL, ctrl, L, R, sub):
     cx = ax+t*dx; cy = ay+t*dy
     d = np.sqrt(np.min((X-cx)**2+(Y-cy)**2, axis=1))  # (m,) nearest dist per point
     ex = d - TL[L+1:R]
+    if vert is not None:
+        # Altitude is not part of the 2-D curve: between two nodes the client
+        # takes it linear in TIME. Score each interior point's miss against that
+        # line in metres over its own vertical tolerance, so a straight-track dive
+        # can no longer drop the fixes that carry its profile.
+        A, T, TA = vert
+        tl, tr = T[L], T[R]
+        w = (T[L+1:R]-tl)/(tr-tl) if tr > tl else np.zeros(R-L-1)
+        da = np.abs(A[L+1:R] - (A[L]+(A[R]-A[L])*w))*FT - TA[L+1:R]
+        ex = np.maximum(ex, da)
     j = int(np.argmax(ex))
     return float(ex[j]), L+1+j
 
-def fit_cr_segment(pts, tolp, sub=12):
+def fit_cr_segment(pts, tolp, sub=12, alts=None, times=None, tol_alt_ft=None):
     """Greedy node placement so centripetal-CR through the kept nodes stays within
     the per-point tolerance. Returns kept indices (incl. both ends).
+
+    With alts/times/tol_alt_ft, a point also counts as missed when its altitude
+    is more than tol_alt_ft off the time-linear altitude between its two nodes.
 
     Incremental: kept nodes form a linked list (nxt/prv); each inter-node span's
     worst error lives in a lazy max-heap. Inserting the worst point splits one span
@@ -198,6 +217,10 @@ def fit_cr_segment(pts, tolp, sub=12):
     if n <= 2: return list(range(n))
     P = np.asarray(pts, dtype=float)
     TL = np.asarray(tolp, dtype=float)
+    vert = None
+    if alts is not None and tol_alt_ft is not None and tol_alt_ft > 0:
+        vert = (np.asarray(alts, dtype=float), np.asarray(times, dtype=float),
+                np.full(n, tol_alt_ft*FT))
     nxt = {0: n-1}; prv = {n-1: 0}
     worst = {}; heap = []
 
@@ -207,7 +230,7 @@ def fit_cr_segment(pts, tolp, sub=12):
         return (p0, P[L], P[R], p3)
 
     def refresh(L, R):
-        ex, wi = _span_worst(P, TL, ctrl_of(L, R), L, R, sub)
+        ex, wi = _span_worst(P, TL, ctrl_of(L, R), L, R, sub, vert)
         worst[(L, R)] = ex
         if wi >= 0:
             heapq.heappush(heap, (-ex, L, R, wi))
@@ -384,6 +407,31 @@ def encode_pred(fit):
                 _uv(2, out); _sv(rx, out); _sv(ry, out)     # 2 = prediction + residual
     return gzip.compress(bytes(out), 9)
 
+def _despike_alt(ms, keys=("geom", "baro"), spike_ft=500.0):
+    """Blank single-sample altitude glitches before they are averaged into a 1 s
+    window. readsb traces carry isolated bad altitudes (2,300 ft in the middle of a
+    25,000 ft climb, 3c64ac on 2026-11-01); once --tol-alt is on, the window mean
+    they pollute is far enough off the time-linear line to be FORCED in as a node,
+    drawing a dip that never happened.
+
+    A sample is a spike when it sits more than spike_ft off the line through its two
+    neighbours AND more than twice the neighbours' own spread. A real dive passes:
+    N722BD's -55,000 ft/min samples stay within ~100 ft of their neighbours' line."""
+    for k in keys:
+        idx = [i for i, m in enumerate(ms) if m.get(k) is not None and not m["gnd"]]
+        bad = []
+        for a, i, b in zip(idx, idx[1:], idx[2:]):
+            va, vi, vb = ms[a][k], ms[i][k], ms[b][k]
+            ta, ti, tb = ms[a]["t"], ms[i]["t"], ms[b]["t"]
+            w = (ti - ta) / (tb - ta) if tb > ta else 0.5
+            dev = abs(vi - (va + (vb - va) * w))
+            if dev > spike_ft and dev > 2 * abs(vb - va):
+                bad.append(i)
+        for i in bad:
+            ms[i] = dict(ms[i]); ms[i][k] = None
+    return ms
+
+
 def _decimate_1hz(ms, min_dt=1.0):
     """Thin to <=1 sample/s in 1 s windows, collapsing each window to the mean of
     BOTH position and time (not snapped to a grid label). readsb sub-second
@@ -535,11 +583,12 @@ def _sphere(lat, lon):
     return (c * math.cos(l), c * math.sin(l), math.sin(p))
 
 
-def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
+def build_nodes_cr(d, elev_fn, tg, tc, corner_deg, ta=TOL_ALT_FT):
     """Node placement whose centripetal-CR reconstruction (what the frontend
     draws) stays within the graduated tolerance -- so NO handles need storing.
     Splits at sharp corners / ground<->air (cusps), greedy-inserts within each."""
     ms = tio.parse(d)
+    if ta and ta > 0: ms = _despike_alt(ms)
     ms = _decimate_1hz(ms); ms = _snap_stationary(ms); n0 = len(ms)
     if n0 < 3: return None
     geom = [m["geom"] for m in ms]
@@ -590,7 +639,8 @@ def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
     for c in range(len(corners)-1):
         lo, hi = corners[c], corners[c+1]
         seg = P[lo:hi+1]; segtol = TP[lo:hi+1]
-        keep = fit_cr_segment(seg, segtol)
+        keep = fit_cr_segment(seg, segtol, alts=A[lo:hi+1], times=T[lo:hi+1],
+                              tol_alt_ft=ta)
         for j, ki in enumerate(keep):
             gi = lo+ki
             if nodes and gi == nodes[-1]["gi"]:      # shared corner node
@@ -666,14 +716,14 @@ def pred_columns(fit):
 
 # ---- multiprocessing worker (globals set by initializer, avoids pickling) ----
 _W = {}
-def _init(csv_path, ge, tg, tc, corner):
+def _init(csv_path, ge, tg, tc, corner, ta):
     _W["elev"] = tio.make_elev_resolver(tio.build_airport_index(csv_path)) if ge else None
-    _W["tg"], _W["tc"], _W["corner"] = tg, tc, corner
+    _W["tg"], _W["tc"], _W["corner"], _W["ta"] = tg, tc, corner, ta
 
 def _work(path):
     try:
         d = tio.load_trace(path)
-        fit = build_nodes_cr(d, _W["elev"], _W["tg"], _W["tc"], _W["corner"])
+        fit = build_nodes_cr(d, _W["elev"], _W["tg"], _W["tc"], _W["corner"], _W["ta"])
         if not fit:
             return None
         cols = light_columns(fit)
@@ -702,7 +752,7 @@ def write_parquet(files, a):
     t0 = time.perf_counter()
     ctx = mp.get_context("fork")
     with ctx.Pool(a.workers, initializer=_init,
-                  initargs=(csvp, a.ge, a.tg, a.tc, a.corner)) as pool:
+                  initargs=(csvp, a.ge, a.tg, a.tc, a.corner, a.ta)) as pool:
         for i, r in enumerate(pool.imap_unordered(_work, files, chunksize=8)):
             if r is None: continue
             if "err" in r:
@@ -769,6 +819,8 @@ def main():
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--tol-ground", dest="tg", type=float, default=2.0)
     ap.add_argument("--tol-cruise", dest="tc", type=float, default=150.0)
+    ap.add_argument("--tol-alt", dest="ta", type=float, default=TOL_ALT_FT,
+                    help="max altitude miss in ft vs time-linear altitude between nodes (0 = off)")
     ap.add_argument("--corner", type=float, default=35.0)
     ap.add_argument("--ground-elevation", dest="ge", action="store_true")
     ap.add_argument("--airports", default=None)

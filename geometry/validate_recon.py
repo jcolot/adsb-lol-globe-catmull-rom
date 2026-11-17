@@ -51,8 +51,9 @@ def nearest_to_polyline(pt, poly, lo, hi):
         if d < best: best = d
     return best
 
-def validate_one(d, elev_fn, tg, tc, corner, report_worst=False):
-    fit = fb.build_nodes_cr(d, elev_fn, tg, tc, corner)
+def validate_one(d, elev_fn, tg, tc, corner, report_worst=False, ta=None):
+    ta = fb.TOL_ALT_FT if ta is None else ta
+    fit = fb.build_nodes_cr(d, elev_fn, tg, tc, corner, ta)
     if not fit: return None
     nodes = fit["nodes"]; kx = fit["kx"]
     # reconstruct CR polyline, broken at cusp nodes
@@ -69,6 +70,10 @@ def validate_one(d, elev_fn, tg, tc, corner, report_worst=False):
     ax, ay = px[:-1], py[:-1]; bx, by = px[1:], py[1:]
     dx, dy = bx-ax, by-ay; L2 = dx*dx+dy*dy; L2[L2 == 0] = 1e-9
     errs = []; within = 0; ntot = 0; worst = (0.0, None)
+    # altitude: the client interpolates it linearly in TIME between nodes, so
+    # check every airborne raw point that has a geometric altitude against that
+    NT = np.array([n["t"] for n in nodes]); NA = np.array([n["alt"] for n in nodes], dtype=float)
+    aerrs = []; awithin = 0; aworst = (0.0, None)
     for p in d.get("trace", []):
         la, lo = p[1], p[2]
         if la is None: continue
@@ -83,9 +88,21 @@ def validate_one(d, elev_fn, tg, tc, corner, report_worst=False):
         if d_ > worst[0]:
             worst = (d_, (int(p[0]), alt, p[3] == "ground", tol))
     errs = np.array(errs)
+    # reference = raw geom with the fitter's own spike filter applied: an isolated
+    # glitch is not signal, and scoring the fit against it hides real misses
+    for m in fb._despike_alt(tio.parse(d), keys=("geom",)):
+        if m["gnd"] or m["geom"] is None or not NT[0] <= m["t"] <= NT[-1]: continue
+        e = abs(m["geom"] - float(np.interp(m["t"], NT, NA)))
+        aerrs.append(e)
+        if ta <= 0 or e <= ta*1.5 + 25: awithin += 1
+        if e > aworst[0]: aworst = (e, int(m["t"]))
     r = dict(icao=d.get("icao"), n=ntot, nodes=len(nodes),
              med=float(np.median(errs)), p95=float(np.percentile(errs, 95)),
              mx=float(errs.max()), within_pct=100.0*within/max(ntot, 1))
+    if aerrs:
+        aerrs = np.array(aerrs)
+        r.update(a_p95=float(np.percentile(aerrs, 95)), a_mx=float(aerrs.max()),
+                 a_within_pct=100.0*awithin/len(aerrs), a_worst=aworst)
     if report_worst: r["worst"] = worst
     return r
 
@@ -94,6 +111,8 @@ def main():
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--tol-ground", dest="tg", type=float, default=2.0)
     ap.add_argument("--tol-cruise", dest="tc", type=float, default=150.0)
+    ap.add_argument("--tol-alt", dest="ta", type=float, default=None,
+                    help="altitude tolerance in ft (default: fit_spline's)")
     ap.add_argument("--corner", type=float, default=35.0)
     ap.add_argument("--ground-elevation", dest="ge", action="store_true")
     ap.add_argument("--airports", default=None)
@@ -108,7 +127,7 @@ def main():
     for f in files:
         try:
             r = validate_one(tio.load_trace(f), elev_fn, a.tg, a.tc, a.corner,
-                             report_worst=(len(files) == 1))
+                             report_worst=(len(files) == 1), ta=a.ta)
         except Exception as e:
             print(f"  skip {os.path.basename(f)}: {e}", file=sys.stderr); continue
         if r: rows.append(r)
@@ -123,6 +142,9 @@ def main():
             t, alt, gnd, tol = r["worst"][1]
             print(f"  worst point: t={t} alt={alt} {'GND' if gnd else 'AIR'} "
                   f"(tol {tol:.0f}m, err {r['worst'][0]:.0f}m)")
+        if "a_mx" in r:
+            print(f"  altitude vs raw geom:   p95 {r['a_p95']:.0f}ft  max {r['a_mx']:.0f}ft "
+                  f"at t={r['a_worst'][1]}  within {r['a_within_pct']:.1f}%")
         return
     med = np.median([r["med"] for r in rows])
     p95 = np.median([r["p95"] for r in rows])
@@ -132,6 +154,11 @@ def main():
     print(f"CR reconstruction vs raw over {len(rows)} aircraft (tol {a.tg:.0f}->{a.tc:.0f}m):")
     print(f"  median-of-medians {med:.1f}m   median-p95 {p95:.1f}m   worst-max {mx:.0f}m")
     print(f"  mean within-tol   {win:.1f}%")
+    ar = [r for r in rows if "a_mx" in r]
+    if ar:
+        print(f"  altitude: median-p95 {np.median([r['a_p95'] for r in ar]):.0f}ft   "
+              f"worst-max {max(r['a_mx'] for r in ar):.0f}ft   "
+              f"mean within-tol {np.mean([r['a_within_pct'] for r in ar]):.1f}%")
     print("  worst by p95:")
     for r in worst:
         print(f"    {r['icao']}: p95 {r['p95']:.0f}m max {r['mx']:.0f}m within {r['within_pct']:.0f}% ({r['nodes']} nodes)")
