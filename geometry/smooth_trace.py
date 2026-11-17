@@ -29,11 +29,12 @@ import argparse, glob, math, os, sys
 import numpy as np
 import importlib.util
 
-# reuse loaders / airport elevation from compress_trace.py
+# trace loading / parsing / airport elevation shared with fit_spline.py
 _spec = importlib.util.spec_from_file_location(
-    "ct", os.path.join(os.path.dirname(os.path.abspath(__file__)), "compress_trace.py"))
-ct = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ct)
+    "trace_io", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trace_io.py"))
+tio = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tio)
+parse = tio.parse
 
 FT = 0.3048          # ft -> m
 LAT_SCALE = 1e5
@@ -71,48 +72,6 @@ def source_noise(src):
     return 40.0, 5.0, 25.0
 
 
-def parse(d, elev_fn=None):
-    """Extract per-sample measurements from a decoded trace."""
-    raw = d.get("trace", [])
-    ms = []
-    for p in raw:
-        t = p[0]
-        gnd = p[3] == "ground"
-        baro = p[3] if isinstance(p[3], (int, float)) else None
-        geom = p[10] if len(p) > 10 and isinstance(p[10], (int, float)) else None
-        gs = p[4] if isinstance(p[4], (int, float)) else None
-        trk = p[5] if isinstance(p[5], (int, float)) else None
-        vr = None
-        if len(p) > 11 and isinstance(p[11], (int, float)):
-            vr = p[11]                          # geometric vertical rate, ft/min
-        elif isinstance(p[7], (int, float)):
-            vr = p[7]                           # barometric vertical rate
-        src = None
-        if len(p) > 9 and isinstance(p[9], dict):
-            src = p[9].get("type")
-        elif len(p) > 9 and isinstance(p[9], str):
-            src = p[9]
-        # readsb emits the aircraft-details object only on the samples where a
-        # field CHANGED, so `flight` is sparse and its index varies by trace
-        # variant (8 = details, 9 = source type; some writers shift them). Scan
-        # both for a dict CARRYING A CALLSIGN -- stopping at the first dict is
-        # not the same thing and silently drops callsigns, because index 9 is
-        # itself a dict in the common variant (see `src` above): a writer that
-        # puts the source type at 8 would end the scan before the details object
-        # at 9 was ever looked at, and so would a details object whose `flight`
-        # is absent or blank on this particular sample.
-        flight = None
-        for k in (8, 9):
-            if len(p) > k and isinstance(p[k], dict):
-                f = p[k].get("flight")
-                if isinstance(f, str) and f.strip():
-                    flight = f.strip()
-                    break
-        ms.append(dict(t=t, lat=p[1], lon=p[2], gnd=gnd, baro=baro, geom=geom,
-                       gs=gs, trk=trk, vr=vr, src=src, flight=flight))
-    return ms
-
-
 def smooth(ms, elev_fn=None, qh=2.0, qv=1.0, qh_gnd=0.05, gate=16.0, gnd_pos_mult=3.0):
     """Forward CA-KF + RTS smoother. Returns list of (t, lat, lon, alt_ft, gnd)."""
     n = len(ms)
@@ -128,7 +87,7 @@ def smooth(ms, elev_fn=None, qh=2.0, qv=1.0, qh_gnd=0.05, gate=16.0, gnd_pos_mul
     # baro-only samples (pressure altitude diverges from MSL with height)
     off_known = [(m["geom"] - m["baro"]) if (m["geom"] is not None and m["baro"] is not None)
                  else None for m in ms]
-    off = ct._interp_fill(off_known, [m["t"] for m in ms])
+    off = tio.interp_fill(off_known, [m["t"] for m in ms])
 
     def alt_meas(i):
         m = ms[i]
@@ -249,6 +208,83 @@ def smooth(ms, elev_fn=None, qh=2.0, qv=1.0, qh_gnd=0.05, gate=16.0, gnd_pos_mul
     return out
 
 
+# ------------------ graduated Douglas-Peucker (decimate) -------------------
+class Tol:
+    def __init__(self, a):
+        self.hg, self.hl, self.hc = a.h_ground, a.h_low, a.h_cruise
+        self.vg, self.vc = a.v_ground, a.v_cruise
+        self.lo, self.hi = a.low_alt, a.high_alt
+
+    def _ramp(self, alt, lo_val, hi_val):
+        if alt <= self.lo:
+            return lo_val
+        if alt >= self.hi:
+            return hi_val
+        return lo_val + (hi_val - lo_val) * (alt - self.lo) / (self.hi - self.lo)
+
+    def horiz(self, alt, ground):
+        return self.hg if ground else self._ramp(alt, self.hl, self.hc)
+
+    def vert(self, alt, ground):
+        return self.vg if ground else self._ramp(alt, self.vg, self.vc)
+
+
+def dp_horizontal(P, alt, ground, tol):
+    n = len(P)
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b <= a + 1:
+            continue
+        ax, ay = P[a]
+        bx, by = P[b]
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy) or 1e-9
+        dmax, idx, tmin = -1.0, -1, float("inf")
+        for i in range(a + 1, b):
+            px, py = P[i]
+            d = abs((px - ax) * dy - (py - ay) * dx) / L
+            if d > dmax:
+                dmax, idx = d, i
+            ti = tol.horiz(alt[i], ground[i])
+            if ti < tmin:
+                tmin = ti
+        if dmax > tmin:
+            keep[idx] = True
+            stack.append((a, idx))
+            stack.append((idx, b))
+    return keep
+
+
+def dp_vertical(t, y, ground, tol):
+    n = len(t)
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b <= a + 1:
+            continue
+        ta, tb, ya, yb = t[a], t[b], y[a], y[b]
+        span = (tb - ta) or 1e-9
+        dmax, idx, tmin = -1.0, -1, float("inf")
+        for i in range(a + 1, b):
+            yi = ya + (yb - ya) * (t[i] - ta) / span
+            d = abs(y[i] - yi)
+            if d > dmax:
+                dmax, idx = d, i
+            ti = tol.vert(y[i], ground[i])
+            if ti < tmin:
+                tmin = ti
+        if dmax > tmin:
+            keep[idx] = True
+            stack.append((a, idx))
+            stack.append((idx, b))
+    return keep
+
+
 def decimate(res, tol):
     """Graduated Douglas-Peucker on the ALREADY-SMOOTH curve, + timestamp dedup.
     No gate/despike/deglitch needed -- the smoother removed the impossibilities."""
@@ -263,8 +299,8 @@ def decimate(res, tol):
     lat0 = sum(lats) / n
     mlon = 111320.0 * math.cos(math.radians(lat0))
     P = [(lons[i] * mlon, lats[i] * 111320.0) for i in range(n)]
-    kh = ct.dp_horizontal(P, alts, gnd, tol)
-    kv = ct.dp_vertical(ts, alts, gnd, tol)
+    kh = dp_horizontal(P, alts, gnd, tol)
+    kv = dp_vertical(ts, alts, gnd, tol)
     keep = [x or y for x, y in zip(kh, kv)]
     kept = [(ts[i], lats[i], lons[i], alts[i], gnd[i]) for i in range(n) if keep[i]]
     dedup = []
@@ -289,7 +325,7 @@ def main():
     ap.add_argument("--gnd-pos-mult", dest="gnd_pos_mult", type=float, default=3.0,
                     help="inflate on-ground position noise by this (trust model over fixes)")
     ap.add_argument("--dense", action="store_true", help="skip decimation (debug)")
-    # graduated DP tolerances (same as compress_trace.py)
+    # graduated DP tolerances
     ap.add_argument("--h-ground", dest="h_ground", type=float, default=5.0)
     ap.add_argument("--h-low", dest="h_low", type=float, default=20.0)
     ap.add_argument("--h-cruise", dest="h_cruise", type=float, default=150.0)
@@ -300,7 +336,7 @@ def main():
     ap.add_argument("--dump", action="store_true", help="print one smoothed track")
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
-    tol = ct.Tol(a)
+    tol = Tol(a)
 
     elev_fn = None
     if a.ge:
@@ -310,13 +346,13 @@ def main():
             for c in (os.path.join(root, "airports.csv"), "airports.csv"):
                 if os.path.exists(c):
                     csvp = c; break
-        elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))
+        elev_fn = tio.make_elev_resolver(tio.build_airport_index(csvp))
         print(f"  airport elevations from {csvp}", flush=True)
 
-    files = ct.collect(a.paths, a.limit)
+    files = tio.collect(a.paths, a.limit)
 
     if a.dump:
-        d = ct.load_trace(files[0])
+        d = tio.load_trace(files[0])
         res = smooth(parse(d, elev_fn), elev_fn, a.qh, a.qv, qh_gnd=a.qh_gnd, gnd_pos_mult=a.gnd_pos_mult)
         for (t, la, lo, al, g) in res[:60]:
             print(f"  t={t} lat={la:.6f} lon={lo:.6f} alt={al:7.1f} {'GND' if g else ''}")
@@ -328,7 +364,7 @@ def main():
     done = 0
     for f in files:
         try:
-            d = ct.load_trace(f)
+            d = tio.load_trace(f)
             res = smooth(parse(d, elev_fn), elev_fn, a.qh, a.qv, qh_gnd=a.qh_gnd, gnd_pos_mult=a.gnd_pos_mult)
         except Exception as e:
             print(f"  skip {os.path.basename(f)}: {e}", file=sys.stderr); continue

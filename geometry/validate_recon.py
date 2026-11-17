@@ -16,7 +16,7 @@ def _load(m, p):
     s.loader.exec_module(x); return x
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # airports.csv lives at the repo root
-ct = _load("ct", os.path.join(HERE, "compress_trace.py"))
+tio = _load("trace_io", os.path.join(HERE, "trace_io.py"))
 fb = _load("fb", os.path.join(HERE, "fit_spline.py"))
 
 def tol_at(alt, tg, tc, lo=500.0, hi=12000.0):
@@ -33,7 +33,7 @@ def cr_seg(P, sub=16):
         p1 = P[i]; p2 = P[i+1]
         p3 = P[i+2] if i+2 < len(P) else P[i+1]
         for k in range(sub):
-            out.append(ct.cr_point(p0, p1, p2, p3, k/sub))
+            out.append(tio.cr_point(p0, p1, p2, p3, k/sub))
     out.append(P[-1])
     return out
 
@@ -102,12 +102,12 @@ def main():
     elev_fn = None
     if a.ge:
         csvp = a.airports or os.path.join(ROOT, "airports.csv")
-        elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))
-    files = ct.collect(a.paths, a.limit)
+        elev_fn = tio.make_elev_resolver(tio.build_airport_index(csvp))
+    files = tio.collect(a.paths, a.limit)
     rows = []
     for f in files:
         try:
-            r = validate_one(ct.load_trace(f), elev_fn, a.tg, a.tc, a.corner,
+            r = validate_one(tio.load_trace(f), elev_fn, a.tg, a.tc, a.corner,
                              report_worst=(len(files) == 1))
         except Exception as e:
             print(f"  skip {os.path.basename(f)}: {e}", file=sys.stderr); continue

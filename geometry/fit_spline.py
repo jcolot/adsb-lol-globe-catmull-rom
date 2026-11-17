@@ -35,8 +35,7 @@ def _load(mod, path):
     s.loader.exec_module(m); return m
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # airports.csv lives at the repo root
-ct = _load("ct", os.path.join(HERE, "compress_trace.py"))
-st = _load("st", os.path.join(HERE, "smooth_trace.py"))
+tio = _load("trace_io", os.path.join(HERE, "trace_io.py"))
 
 FT = 0.3048
 Q_POS = 1e5            # deg quantum (~1.1 m lat)
@@ -233,7 +232,7 @@ def fit_cr_segment(pts, tolp, sub=12):
 
 # ---------------- build nodes ----------------
 def build_nodes(d, elev_fn, tg, tc, corner_deg):
-    ms = st.parse(d)
+    ms = tio.parse(d)
     n0 = len(ms)
     if n0 < 3: return None
     # altitude datum (geometric preferred, baro+local offset fallback), ground snap
@@ -241,7 +240,7 @@ def build_nodes(d, elev_fn, tg, tc, corner_deg):
     baro = [m["baro"] if not m["gnd"] else None for m in ms]
     offk = [(geom[i]-baro[i]) if (geom[i] is not None and baro[i] is not None) else None
             for i in range(n0)]
-    off = ct._interp_fill(offk, [m["t"] for m in ms])
+    off = tio.interp_fill(offk, [m["t"] for m in ms])
     lat0 = sum(m["lat"] for m in ms)/n0; kx = math.cos(math.radians(lat0))
     P=[]; G=[]; A=[]
     for i, m in enumerate(ms):
@@ -459,13 +458,13 @@ def extract_callsigns(d):
     Reading them off the stored CR nodes would be wrong: greedy node placement
     optimises curve fidelity, and the >=1 m dedup in build_nodes_cr discards
     stationary ground samples outright, so the node nearest a change can sit tens
-    of seconds from it. This pass therefore works on st.parse output at full rate.
+    of seconds from it. This pass therefore works on tio.parse output at full rate.
     It is O(n) and negligible next to the fit, and it does not touch the geometry
     output.
 
     Returns [(t, flight)], sparse -- one entry per change -- with t in SECONDS
     relative to the trace's `timestamp` base."""
-    ms = st.parse(d)
+    ms = tio.parse(d)
     if len(ms) < 2: return None
     cs = []
     for m in ms:                                   # sparse: only on change
@@ -540,14 +539,14 @@ def build_nodes_cr(d, elev_fn, tg, tc, corner_deg):
     """Node placement whose centripetal-CR reconstruction (what the frontend
     draws) stays within the graduated tolerance -- so NO handles need storing.
     Splits at sharp corners / ground<->air (cusps), greedy-inserts within each."""
-    ms = st.parse(d)
+    ms = tio.parse(d)
     ms = _decimate_1hz(ms); ms = _snap_stationary(ms); n0 = len(ms)
     if n0 < 3: return None
     geom = [m["geom"] for m in ms]
     baro = [m["baro"] if not m["gnd"] else None for m in ms]
     offk = [(geom[i]-baro[i]) if (geom[i] is not None and baro[i] is not None) else None
             for i in range(n0)]
-    off = ct._interp_fill(offk, [m["t"] for m in ms])
+    off = tio.interp_fill(offk, [m["t"] for m in ms])
     lat0 = sum(m["lat"] for m in ms)/n0; kx = math.cos(math.radians(lat0))
     P=[]; G=[]; A=[]; T=[]; GE=[]
     for i, m in enumerate(ms):
@@ -668,12 +667,12 @@ def pred_columns(fit):
 # ---- multiprocessing worker (globals set by initializer, avoids pickling) ----
 _W = {}
 def _init(csv_path, ge, tg, tc, corner):
-    _W["elev"] = ct.make_elev_resolver(ct.build_airport_index(csv_path)) if ge else None
+    _W["elev"] = tio.make_elev_resolver(tio.build_airport_index(csv_path)) if ge else None
     _W["tg"], _W["tc"], _W["corner"] = tg, tc, corner
 
 def _work(path):
     try:
-        d = ct.load_trace(path)
+        d = tio.load_trace(path)
         fit = build_nodes_cr(d, _W["elev"], _W["tg"], _W["tc"], _W["corner"])
         if not fit:
             return None
@@ -779,7 +778,7 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     a = ap.parse_args()
 
-    files = ct.collect(a.paths, a.limit)
+    files = tio.collect(a.paths, a.limit)
 
     if a.parquet:
         return write_parquet(files, a)
@@ -787,10 +786,10 @@ def main():
     elev_fn = None
     if a.ge:
         csvp = a.airports or os.path.join(ROOT, "airports.csv")
-        elev_fn = ct.make_elev_resolver(ct.build_airport_index(csvp))
+        elev_fn = tio.make_elev_resolver(tio.build_airport_index(csvp))
 
     if a.dump:
-        d = ct.load_trace(files[0])
+        d = tio.load_trace(files[0])
         t0 = time.perf_counter()
         fit = build_nodes(d, elev_fn, a.tg, a.tc, a.corner)
         dt = time.perf_counter()-t0
@@ -805,7 +804,7 @@ def main():
     per_ms = []
     for f in files:
         try:
-            d = ct.load_trace(f)
+            d = tio.load_trace(f)
             ts = time.perf_counter()
             fit = build_nodes(d, elev_fn, a.tg, a.tc, a.corner)
             per_ms.append((time.perf_counter()-ts)*1000)

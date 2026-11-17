@@ -38,8 +38,9 @@ hour?" with **zero further requests**, then one HTTP range read per track drawn.
    tracks.bin + meta.json` (the queryable **day bundle** — see [docs/bundle-format.md](docs/bundle-format.md)).
    `verify_bundle.py` is its correctness gate and the reference decoder.
 
-`smooth_trace.py`, `compress_trace.py`, `validate_recon.py` are supporting /
-diagnostic modules (`validate_recon.py` measures reconstruction error vs raw).
+`trace_io.py` holds the shared trace reader, parser and airport-elevation lookup.
+`validate_recon.py` is a diagnostic (reconstruction error vs raw), and
+`smooth_trace.py` is a standalone Kalman-smoother prototype, not on the pipeline.
 
 ### Layout
 

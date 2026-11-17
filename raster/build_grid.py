@@ -83,7 +83,7 @@ GAP_MODE = "best"          # best | band | arc -- see resolve_gaps
 def _fixes(blob):
     """(lat, lon, on_ground) from one trace_full JSON blob, or None if unusable.
 
-    Matches smooth_trace.parse's view of the format: d["trace"] is a list of
+    Matches trace_io.parse's view of the format: d["trace"] is a list of
     fixes whose [1] and [2] are lat and lon and whose [3] is the altitude or the
     string "ground". The altitudes and speeds are irrelevant at 20 km/px; the
     ground flag is not -- it is what delimits a leg.
