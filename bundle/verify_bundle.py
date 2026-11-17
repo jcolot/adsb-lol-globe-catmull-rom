@@ -483,16 +483,25 @@ def main():
     # ---- 4. index: no false negatives -------------------------------------
     print("\nindex")
     res = meta["index_res"]
-    # A box's covering cell set is polygonToCells (centroid-in-polygon) RING-
-    # EXPANDED by one: a node just inside the box can sit in a cell whose
-    # centroid is outside it. The client must do the same, or it will miss legs.
+    # A box's covering cell set is every cell whose BOUNDARY overlaps the box
+    # (polygonToCellsExperimental, CONTAINMENT_OVERLAPPING). The client must
+    # use the same rule, or it will miss legs.
+    #
+    # This used to be centroid-in-polygon ring-expanded by one, which is only
+    # a cover when the box is several cells wide. A box narrower than a cell
+    # can hold stretches with no cell centroid inside it, and a node there sits
+    # two or more rings from anything polygonToCells returned. On 2026-11-14
+    # that failed the gate twice: everything above 88.63N in a 10-degree box
+    # (10 degrees of longitude is under 20 km there), and a 23 km strip along
+    # the south edge of a 1-degree box at 68N. About 5% of random boxes had
+    # such a hole; overlap containment covered every point of 1000 random and
+    # polar boxes, with fewer cells than the ring did.
     def cover(w, s, e, n):
         wkt = (f"POLYGON (({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))")
-        rows = con.execute(f"""
-            SELECT DISTINCT unnest(h3_grid_disk(c, 1)) FROM (
-              SELECT unnest(h3_polygon_wkt_to_cells('{wkt}', {res})) AS c)
-        """).fetchall()
-        return [r[0] for r in rows]
+        cells = con.execute(f"""
+            SELECT h3_polygon_wkt_to_cells_experimental('{wkt}', {res}, 'overlap')
+        """).fetchone()[0]
+        return list(cells or [])
 
     la0, la1, lo0, lo1 = con.execute(f"""
         SELECT min(lat)/{qpos}.0, max(lat)/{qpos}.0,
