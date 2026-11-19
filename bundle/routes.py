@@ -15,11 +15,22 @@ dep_src / arr_src:
           its neighbour on the route; with neither known, the seen track must
           run from A towards B.
 
-Every fill must also be physically possible: the seen track heads towards the
-filled airport (or came from it), and the aircraft can reach it at KMH between
-its last seen fix and the next leg's first. A route fill that then disagrees
-with the aircraft's adjacent leg is withdrawn. Observed ends are never
-overwritten.
+Every fill must also be physically possible:
+  - the seen track got closer to the filled airport (or further from the
+    filled origin) by no less than -SLACK_KM;
+  - the HEADING at the seen end points there: the direction of travel over the
+    last (first) ~30 km is within MAX_TURN_DEG of the great-circle bearing to
+    (from) the airport, unless the airport is within NEAR_TURN_KM, where
+    vectors and holds turn the aircraft any way. Getting closer alone let
+    QR8099, lost over Algeria descending at Algiers, be filled to Doha 86 deg
+    off its nose; the schedule caught five such fills out of EBBR on 2026-11-15;
+  - an end seen low (below LOW_FT) and descending (or climbing, at a
+    departure) is close to its airport: at most SLACK_KM + LOW_KM_PER_FT * alt,
+    about three times a 3-degree glide path;
+  - the aircraft can reach it at KMH between its last seen fix and the next
+    leg's first.
+A route fill that then disagrees with the aircraft's adjacent leg is withdrawn.
+Observed ends are never overwritten.
 
 VRS routes are typed in by volunteers, one per callsign, with no date: they go
 stale (SXS6YH was EDDL-LTBS in VRS while the trace showed it leaving EBBR).
@@ -37,6 +48,11 @@ import csv, glob, math, os, re
 
 KMH = 950.0                 # generous jet ground speed for reachability
 SLACK_KM = 50.0
+MAX_TURN_DEG = 45.0         # heading at the seen end vs bearing to the airport
+NEAR_TURN_KM = 100.0        # ...not checked this close in
+LOW_FT = 20000.0            # an end seen below this, descending/climbing,
+LOW_KM_PER_FT = 0.01        # ...is within SLACK_KM + this * alt of its airport
+LEVEL_FT = 1000.0           # altitude change that counts as descending/climbing
 OBSERVED = ("ground", "air")
 
 
@@ -54,6 +70,37 @@ def _gc(a, b):
     return 6371 * 2 * math.asin(math.sqrt(
         math.sin((p2 - p1) / 2) ** 2
         + math.cos(p1) * math.cos(p2) * math.sin((l2 - l1) / 2) ** 2))
+
+
+def _bearing(a, b):
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    dl = math.radians(b[1] - a[1])
+    return math.degrees(math.atan2(
+        math.sin(dl) * math.cos(p2),
+        math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl))) % 360
+
+
+def _turn(h1, h2):
+    return abs((h1 - h2 + 180) % 360 - 180)
+
+
+def heading_ok(trk, fix, apt, d, inbound):
+    """Does the travel direction `trk` at `fix` agree with airport `apt` at
+    distance d? inbound: flying TO it (an arrival); else FROM it (a departure:
+    the airport lies behind, so the bearing to it is trk + 180)."""
+    if trk is None or d <= NEAR_TURN_KM:
+        return True
+    want = trk if inbound else (trk + 180) % 360
+    return _turn(want, _bearing(fix, apt)) <= MAX_TURN_DEG
+
+
+def low_ok(alt, dalt, d, inbound):
+    """An end seen low and descending (arrival) / climbing (departure) is near."""
+    if alt is None or dalt is None or alt >= LOW_FT:
+        return True
+    if (-dalt if inbound else dalt) < LEVEL_FT:
+        return True
+    return d <= SLACK_KM + LOW_KM_PER_FT * max(alt, 0)
 
 
 class Routes:
@@ -139,14 +186,16 @@ class Routes:
 def new_stats():
     return dict(chain_arr=0, chain_dep=0, route_arr=0, route_dep=0, route_both=0,
                 route_contradicts_observed=0, route_implausible=0,
-                no_callsign=0, callsign_not_in_routes=0, withdrawn_conflict=0)
+                no_callsign=0, callsign_not_in_routes=0, withdrawn_conflict=0,
+                heading_rejected=0, low_rejected=0)
 
 
 def fill_aircraft(legs, coords, routes, st):
     """Fill one aircraft's legs IN PLACE. `legs` is time-ordered; each is a dict
     with dep, arr, dep_gnd, arr_gnd, flight, off_s / on_s (absolute seconds of
     the first / last seen airborne fix) and f0 / f1 ((lat, lon) of those
-    fixes). Adds dep_src, arr_src and route. `coords` maps ident -> (lat, lon);
+    fixes), and optionally trk0/alt0/dalt0, trk1/alt1/dalt1 (build_legs.end_track;
+    missing or None skips that check). Adds dep_src, arr_src and route. `coords` maps ident -> (lat, lon);
     `routes` may be None (chain only)."""
     n = len(legs)
     for l in legs:
@@ -163,6 +212,12 @@ def fill_aircraft(legs, coords, routes, st):
         d1 = _gc(l["f1"], coords[x])
         if _gc(l["f0"], coords[x]) + SLACK_KM < d1:      # moving away from x
             return False
+        if not heading_ok(l.get("trk1"), l["f1"], coords[x], d1, True):
+            st["heading_rejected"] += 1
+            return False
+        if not low_ok(l.get("alt1"), l.get("dalt1"), d1, True):
+            st["low_rejected"] += 1
+            return False
         if i + 1 < n:
             nx = legs[i + 1]
             h = (nx["off_s"] - l["on_s"]) / 3600.0
@@ -176,6 +231,12 @@ def fill_aircraft(legs, coords, routes, st):
             return False
         d0 = _gc(l["f0"], coords[x])
         if _gc(l["f1"], coords[x]) + SLACK_KM < d0:      # track came from elsewhere
+            return False
+        if not heading_ok(l.get("trk0"), l["f0"], coords[x], d0, False):
+            st["heading_rejected"] += 1
+            return False
+        if not low_ok(l.get("alt0"), l.get("dalt0"), d0, False):
+            st["low_rejected"] += 1
             return False
         if i > 0:
             pv = legs[i - 1]

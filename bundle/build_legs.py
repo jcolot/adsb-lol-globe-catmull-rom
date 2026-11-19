@@ -148,7 +148,16 @@ SKIP_AIRPORT_TYPES = {"closed", "balloonport"}
 #     two are co-sited: the scheduled one within SITE_KM of the nearest
 #     candidate. So BEL lands at EBBR, while a Belgian Air Force C-130 at the
 #     same spot still resolves to EBMB.
-# An unknown type or callsign keeps plain nearest-match.
+#   - (AIR_ANCHOR) an AIRLINE end anchored IN THE AIR -- the lowest approach or
+#     climb-out fix, no surface message -- resolves to scheduled airports
+#     only (still within NEAR_KM), and to nothing when none is. The lowest
+#     fix of an approach lost in a coverage hole can be anywhere on the last
+#     30 km, and a strip under it won: on 2026-11-15 the schedule of EBBR's
+#     own flights caught US-12876 for Miami, IT-0219 for Florence, TR-0034 for
+#     Eskisehir and ES-0151 for Vitoria, 6-34 km from the real field. Left
+#     unknown, the end goes to routes.py, which fills it from the callsign. A
+#     GROUND anchor keeps the rules above: an airliner on a strip's surface
+#     was there.
 SITE_KM = 5.0
 NO_FIELD_FOR = {"L": {"heliport", "seaplane_base"},     # landplane
                 "G": {"heliport", "seaplane_base"},     # gyroplane
@@ -207,7 +216,8 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
         anchor only, and then a field the fix is more than max_agl_ft above is
         not a candidate -- see ANCHOR_MAX_AGL_FT. Ground anchors pass None.
         `species` (VRS SpeciesCode) and `airline` apply the shadow-field rules
-        at SITE_KM; both default to plain nearest-match."""
+        at SITE_KM, and with `alt` given `airline` also keeps only scheduled
+        airports (AIR_ANCHOR); both default to plain nearest-match."""
         # keyed on the EXACT fix. It used to be rounded to 0.01 deg (~1 km), so
         # the first fix to land in a square decided the airport for every later
         # one there, so a leg's airport depended on processing order and could
@@ -231,6 +241,8 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
                     d = _km(lat, lon, alat, alon)
                     if d < max_km:
                         cand.append((d, ident, sched, alat, alon))
+        if airline and alt is not None:
+            cand = [c for c in cand if c[2]]    # see AIR_ANCHOR rule above
         best = None
         if cand:
             cand.sort()
@@ -248,6 +260,44 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
 def _km(la1, lo1, la2, lo2):
     return math.hypot((la2 - la1) * 111.32,
                       (lo2 - lo1) * 111.32 * math.cos(math.radians(la1)))
+
+
+TRACK_KM = 30.0         # an end's track is measured over at least this far...
+TRACK_DS = 6000         # ...or this long (deciseconds = 10 min), whichever first
+
+
+def _bearing(la1, lo1, la2, lo2):
+    """Initial great-circle bearing, degrees clockwise from north."""
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dl = math.radians(lo2 - lo1)
+    return math.degrees(math.atan2(
+        math.sin(dl) * math.cos(p2),
+        math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl))) % 360
+
+
+def end_track(ts, la, lo, al, s, e, at_end):
+    """(track, alt, dalt) of the aircraft at one end of its airborne run s..e:
+    the direction of TRAVEL (deg) over the last (at_end) or first TRACK_KM /
+    TRACK_DS of the run, the altitude (ft) at the end fix, and the altitude
+    change over that window in the direction of travel (positive = climbing).
+    track is None when the run never gets TRACK_KM from the end fix, since a
+    shorter chord is mostly turn and noise; alt/dalt are None without altitude.
+    routes.py uses these to refuse a route fill the seen track points away from."""
+    i = e if at_end else s
+    step = -1 if at_end else 1
+    j = i
+    while s <= j + step <= e:
+        j += step
+        if (_km(la[i] / 1e5, lo[i] / 1e5, la[j] / 1e5, lo[j] / 1e5) >= TRACK_KM
+                or abs(ts[i] - ts[j]) >= TRACK_DS):
+            break
+    a, b = (j, i) if at_end else (i, j)         # a -> b is the direction of travel
+    trk = None
+    if _km(la[a] / 1e5, lo[a] / 1e5, la[b] / 1e5, lo[b] / 1e5) >= TRACK_KM:
+        trk = _bearing(la[a] / 1e5, lo[a] / 1e5, la[b] / 1e5, lo[b] / 1e5)
+    alt = al[i]
+    dalt = (al[b] - al[a]) if (al[a] is not None and al[b] is not None and a != b) else None
+    return trk, alt, dalt
 
 
 def segment(ts, la, lo, alt, gnd):
@@ -556,11 +606,15 @@ def main():
             # off_s/on_s only need to be comparable WITHIN this aircraft, so a
             # missing base_ts can fall back to 0 for the fill's reachability test
             b0 = base or 0
+            trk0, alt0, dalt0 = end_track(ts, la, lo, al, s_air, e_air, False)
+            trk1, alt1, dalt1 = end_track(ts, la, lo, al, s_air, e_air, True)
             recs.append(dict(k=k, i0=i0, i1=i1, dep=dep, arr=arr, dep_gnd=dep_gnd,
                              arr_gnd=arr_gnd, flight=flight, t_off=t_off, t_on=t_on,
                              off_s=b0 + t_off / 10.0, on_s=b0 + t_on / 10.0,
                              f0=(la[s_air] / 1e5, lo[s_air] / 1e5),
-                             f1=(la[e_air] / 1e5, lo[e_air] / 1e5)))
+                             f1=(la[e_air] / 1e5, lo[e_air] / 1e5),
+                             trk0=trk0, alt0=alt0, dalt0=dalt0,
+                             trk1=trk1, alt1=alt1, dalt1=dalt1))
         # unseen ends: same-aircraft chain, then callsign routes -- routes.py
         rt.fill_aircraft(recs, coords, routes, fill_st)
         for r in recs:
