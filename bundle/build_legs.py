@@ -148,16 +148,19 @@ SKIP_AIRPORT_TYPES = {"closed", "balloonport"}
 #     two are co-sited: the scheduled one within SITE_KM of the nearest
 #     candidate. So BEL lands at EBBR, while a Belgian Air Force C-130 at the
 #     same spot still resolves to EBMB.
-#   - (AIR_ANCHOR) an AIRLINE end anchored IN THE AIR -- the lowest approach or
+#   - (AIR_ANCHOR) an AIRLINE end with a VRS route, anchored IN THE AIR -- the lowest approach or
 #     climb-out fix, no surface message -- resolves to scheduled airports
 #     only (still within NEAR_KM), and to nothing when none is. The lowest
 #     fix of an approach lost in a coverage hole can be anywhere on the last
 #     30 km, and a strip under it won: on 2026-11-15 the schedule of EBBR's
 #     own flights caught US-12876 for Miami, IT-0219 for Florence, TR-0034 for
 #     Eskisehir and ES-0151 for Vitoria, 6-34 km from the real field. Left
-#     unknown, the end goes to routes.py, which fills it from the callsign. A
-#     GROUND anchor keeps the rules above: an airliner on a strip's surface
-#     was there.
+#     unknown, the end goes to routes.py, which fills it from the callsign --
+#     so the rule applies only when the callsign HAS a VRS route. Without one
+#     (NetJets EJA into Naples or Miami Executive, Kalitta into Willow Run)
+#     the non-scheduled field is likely the real one and nothing would replace
+#     it. A GROUND anchor keeps the rules above: an airliner on a strip's
+#     surface was there.
 SITE_KM = 5.0
 NO_FIELD_FOR = {"L": {"heliport", "seaplane_base"},     # landplane
                 "G": {"heliport", "seaplane_base"},     # gyroplane
@@ -211,13 +214,13 @@ def build_airport_index(path):
 
 def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
     cache = {}
-    def resolve(lat, lon, alt=None, species=None, airline=False):
+    def resolve(lat, lon, alt=None, species=None, airline=False, sched_only=False):
         """Nearest airport within max_km. `alt` (ft) is given for an AIRBORNE
         anchor only, and then a field the fix is more than max_agl_ft above is
         not a candidate -- see ANCHOR_MAX_AGL_FT. Ground anchors pass None.
         `species` (VRS SpeciesCode) and `airline` apply the shadow-field rules
-        at SITE_KM, and with `alt` given `airline` also keeps only scheduled
-        airports (AIR_ANCHOR); both default to plain nearest-match."""
+        at SITE_KM, and with `alt` given `sched_only` keeps only scheduled
+        airports (AIR_ANCHOR); all default to plain nearest-match."""
         # keyed on the EXACT fix. It used to be rounded to 0.01 deg (~1 km), so
         # the first fix to land in a square decided the airport for every later
         # one there, so a leg's airport depended on processing order and could
@@ -225,7 +228,7 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
         # changes dep or arr on 4,708 of its 117,884 legs.
         # Ground fixes repeat exactly (parked, stationary-snapped), so the
         # exact key keeps most of the hits.
-        ck = (lat, lon, alt, species, airline)
+        ck = (lat, lon, alt, species, airline, sched_only)
         if ck in cache:
             return cache[ck]
         excl = NO_FIELD_FOR.get(species, ())
@@ -241,7 +244,7 @@ def make_resolver(grid, max_km=NEAR_KM, max_agl_ft=ANCHOR_MAX_AGL_FT):
                     d = _km(lat, lon, alat, alon)
                     if d < max_km:
                         cand.append((d, ident, sched, alat, alon))
-        if airline and alt is not None:
+        if sched_only and alt is not None:
             cand = [c for c in cand if c[2]]    # see AIR_ANCHOR rule above
         best = None
         if cand:
@@ -399,7 +402,8 @@ def _anchor(al, gnd, idxs, head):
     return min(idxs, key=lambda i: al[i]), False
 
 
-def endpoint_airport(la, lo, al, gnd, i0, i1, resolve, species=None, airline=False):
+def endpoint_airport(la, lo, al, gnd, i0, i1, resolve, species=None, airline=False,
+                     sched_only=False):
     """Nearest airport to each TEMPORAL end of the leg.
 
     The two windows are disjoint by construction, and that is what keeps a leg
@@ -415,9 +419,9 @@ def endpoint_airport(la, lo, al, gnd, i0, i1, resolve, species=None, airline=Fal
     dep_i, dep_gnd = _anchor(al, gnd, range(i0, i0 + w), True)
     arr_i, arr_gnd = _anchor(al, gnd, range(i1 - w + 1, i1 + 1), False)
     dep = resolve(la[dep_i] / 1e5, lo[dep_i] / 1e5,
-                  None if dep_gnd else al[dep_i], species, airline)
+                  None if dep_gnd else al[dep_i], species, airline, sched_only)
     arr = resolve(la[arr_i] / 1e5, lo[arr_i] / 1e5,
-                  None if arr_gnd else al[arr_i], species, airline)
+                  None if arr_gnd else al[arr_i], species, airline, sched_only)
     return dep, arr, dep_gnd, arr_gnd
 
 
@@ -600,9 +604,10 @@ def main():
                       if changes else None)
             # resolved AFTER the callsign: who is flying decides which of two
             # co-sited fields an end belongs to (SITE_KM)
+            airline = bool(routes and routes.is_airline(flight))
             dep, arr, dep_gnd, arr_gnd = endpoint_airport(
-                la, lo, al, gd, i0, i1, resolve, species,
-                bool(routes and routes.is_airline(flight)))
+                la, lo, al, gd, i0, i1, resolve, species, airline,
+                airline and routes.lookup(flight) is not None)
             # off_s/on_s only need to be comparable WITHIN this aircraft, so a
             # missing base_ts can fall back to 0 for the fill's reachability test
             b0 = base or 0

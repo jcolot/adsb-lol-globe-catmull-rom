@@ -151,6 +151,12 @@ class Routes:
 
     _CS = re.compile(r"^(?P<code>[A-Z]{2,3}|[A-Z][0-9]|[0-9][A-Z])(?P<num>\d[A-Z0-9]*)$")
     _NUM = re.compile(r"^\d+[A-Z]{0,2}$")
+    # A US registration flown as the callsign (N912AB, N35KP) has the shape of
+    # an IATA-prefixed flight number (N9 + 12AB): on 2026-11-15 it turned
+    # 9,000 Cessna and Piper legs into "airline" flights NVR12AB, VOS5KP... An
+    # ADS-B airline callsign carries the 3-letter ICAO code, so an N-number is
+    # never read as an IATA one.
+    _NREG = re.compile(r"^N[1-9][0-9]{0,4}[A-Z]{0,2}$")
 
     def normalise(self, cs):
         """The VRS rule (routes/schema-01/README.md): ICAO airline code, then the
@@ -158,8 +164,9 @@ class Routes:
         the last two are letters. An IATA prefix is swapped for its ICAO code."""
         if not cs:
             return None
-        m = self._CS.match(cs.strip().upper())
-        if not m:
+        cs = cs.strip().upper()
+        m = self._CS.match(cs)
+        if not m or (len(m["code"]) == 2 and self._NREG.match(cs)):
             return None
         code, num = m["code"], m["num"]
         if len(code) == 2:
