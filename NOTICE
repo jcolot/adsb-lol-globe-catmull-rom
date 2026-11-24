@@ -1,0 +1,9 @@
+adsb-lol-globe-catmull-rom
+Copyright 2026 Julien Colot
+
+This product includes software developed by Julien Colot
+(https://github.com/jcolot/adsb-lol-globe-catmull-rom).
+
+The data this software produces is not covered by the Apache License. It is
+derived from adsb.lol and is made available under the Open Database License
+(ODbL) v1.0. See the "License" section of README.md.

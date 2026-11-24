@@ -511,7 +511,12 @@ release by this repository's pipeline. Format: docs/bundle-format.md.
 
 airports.tar unpacks to airports/airport=<ICAO>/data_0.parquet. The same files
 are served range-readable from the bucket while the day is within retention:
-$base/"
+$base/
+
+License: Open Database License (ODbL) v1.0, as a derivative of the adsb.lol
+globe_history dataset. Contains information from adsb.lol, which is made
+available here under the Open Database License (ODbL):
+https://opendatacommons.org/licenses/odbl/1-0/"
     if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
         gh release edit "$tag" -R "$repo" --notes "$notes" >/dev/null || return 1
     else

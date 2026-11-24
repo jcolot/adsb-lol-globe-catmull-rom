@@ -121,3 +121,32 @@ The design notes, format specs and ops guides live in [`docs/`](docs/):
 | [Cell query brief](docs/frontend-cell-query.md) | worked frontend implementation of "which planes crossed this H3 cell between T0 and T1?" |
 | [Overnight classification](docs/overnight.md) | the date-offset question, why the margin matters more than the block time, `airport_tz.csv`, the daily splice, BTS validation, the published artifacts |
 | [Daily automation](docs/deployment.md) | the GitHub Actions schedule, configuration, R2 read URLs and CORS |
+
+## License
+
+**Code** — the scripts and docs in this repository are licensed under the
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE).
+
+**Data** — everything the pipeline publishes (the per-airport leg partitions,
+the `flights.parquet` index, the day bundle, the traffic tiles and grids, the
+overnight artifacts, and the `data-<date>` GitHub releases) is derived from the
+[adsb.lol `globe_history`](https://github.com/adsblol/globe_history_2026)
+dataset, which is licensed under the
+[Open Database License (ODbL) v1.0](https://opendatacommons.org/licenses/odbl/1-0/).
+Those outputs are a derivative database and are likewise made available under
+the ODbL v1.0. Any public use of them, including maps and videos drawn from
+them, must keep this attribution:
+
+> Contains information from [adsb.lol](https://adsb.lol), which is made
+> available here under the
+> [Open Database License (ODbL)](https://opendatacommons.org/licenses/odbl/1-0/).
+
+The other inputs:
+
+| input | source | license |
+|---|---|---|
+| ADS-B traces | [adsb.lol `globe_history`](https://github.com/adsblol/globe_history_2026) | ODbL v1.0 |
+| `airports.csv` | [OurAirports](https://ourairports.com/data/) | Public domain |
+| `airport_tz.csv` | generated from `airports.csv` with [timezonefinder](https://github.com/jannikmi/timezonefinder), whose polygons come from [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder) | ODbL v1.0 |
+| callsign routes (`routes` phase) | [VRS standing-data](https://github.com/vradarserver/standing-data) | CC0 1.0 |
+| `geo/coastline.json`, `geo/borders.json` | [Natural Earth](https://www.naturalearthdata.com/) | Public domain |
