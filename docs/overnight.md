@@ -122,6 +122,16 @@ when the data stopped — a real landing leaves descent or ground fixes after
 makes the key unique, and since any flight under 24 h contains at most one
 00:00Z, a leg is never cut into three.
 
+The `arr IS NULL` test depends on `build_legs.py` leaving the cut end
+unresolved, and near an airport it used not to: the airborne-anchor fallback
+named whatever field lay within 10 km and 8,000 ft AGL of the cut, so a
+departure still climbing out at 23:59:59 got its own origin as `arr`. On
+2026-11-15 that was ~1.7k tails and ~1.6k heads, ~1k of them self-loops
+(`KMIA→KMIA`, 0.4 min airborne), none of which the splice could see. Since
+`BOUNDARY_CUT_S`, an end that is airborne on the trace's first/last fix within
+120 s of 00:00Z is left NULL. Days built before that still carry the
+fabricated ends.
+
 ⚠️ **`t_on == t_end` is not by itself a midnight cut.** It says only "still
 airborne at the last fix", and that is equally true of an aircraft that flew
 out of receiver coverage. Measured on 2026-09-08: of 11,768 legs matching it,

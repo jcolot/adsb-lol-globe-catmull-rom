@@ -14,7 +14,9 @@ Pipeline:
   3. departure = nearest airport to the leg's first end-window anchor, arrival =
      nearest to its last (airports.csv, <=10 km, closed fields excluded). The anchor is a ground fix when
      the window has one, else the window's lowest fix, so airports with thin
-     surface coverage still resolve;
+     surface coverage still resolve -- except an airborne end that the 00:00Z
+     archive boundary cut (BOUNDARY_CUT_S), which is left NULL for
+     overnight/splice_legs.py to rejoin;
   4. stamp the callsign (callsigns.parquet) onto each leg: readsb reports `flight`
      only when it CHANGES, so prefer the first change inside the leg (crews set it
      at the stand) and otherwise carry forward the last one set before landing;
@@ -126,6 +128,21 @@ NEAR_KM = 10.0          # max distance from a fix to call it "at" an airport
 # keeps every real approach and departure. Relative to elevation, not MSL, or
 # La Paz (13,300 ft) and Lhasa (11,700) would lose every airborne anchor.
 ANCHOR_MAX_AGL_FT = 8000.0
+# The archive is cut at 00:00Z, so an aircraft still flying then has a day-D
+# leg that ends airborne on its last fix and a day-D+1 leg that starts airborne
+# on its first. Neither end is a takeoff or a landing, but the airborne-anchor
+# fallback resolves it anyway whenever the cut lands within NEAR_KM and
+# ANCHOR_MAX_AGL_FT of a field: a departure still climbing out at 23:59:59 got
+# an ARRIVAL at the airport it had just left. On 2026-11-15, 2,119 day-final
+# legs ended airborne on an air-resolved arr; 635 were self-loops (KMIA->KMIA,
+# 0.4 min airborne, ending 23:59:59), and the mirror on 2026-11-15's first legs
+# was 1,984 and 594. splice_legs.py only recognises a cut end by its NULL, so
+# these were never rejoined either. The window is the cliff in that data: 1,573
+# of the 2,119 last fixes sit within 30 s of midnight, the rate is back to the
+# ~40/min background of genuine coverage dropouts by 2 min. A real landing in
+# that window with no surface fix loses its observed end too; the chain/route
+# fill and the splice can still supply it, a fabricated one they cannot fix.
+BOUNDARY_CUT_S = 120.0
 # OurAirports keeps closed fields in the file (13k of 86k rows), and nearest-
 # match happily picked them: on 2026-08-16, 7,716 of 117,884 legs ended at one,
 # often a closed heliport or seaplane base inside a live airport's 10 km. A
@@ -528,6 +545,10 @@ def main():
         print(f"  routes: {len(routes.by_cs):,} callsigns from {a.routes} "
               f"(commit {routes.commit or 'unknown'})")
     fill_st = rt.new_stats()
+    # 00:00Z that begins and ends this archive, in absolute UTC seconds
+    day_beg = dt.datetime.fromisoformat(day).replace(tzinfo=dt.timezone.utc).timestamp()
+    day_end = day_beg + 86400
+    cut_st = {"dep": 0, "arr": 0}     # resolved ends dropped as boundary cuts
 
     # carry the cusp bit through if the source has one (CR-fit output); the
     # frontend breaks its Catmull-Rom spline at cusp nodes for sharp corners
@@ -608,6 +629,21 @@ def main():
             dep, arr, dep_gnd, arr_gnd = endpoint_airport(
                 la, lo, al, gd, i0, i1, resolve, species, airline,
                 airline and routes.lookup(flight) is not None)
+            # an end the 00:00Z archive boundary cut is not an airport event:
+            # airborne on the trace's very first/last fix, within BOUNDARY_CUT_S
+            # of the boundary. NULL it so splice_legs.py sees the cut.
+            if base is not None:
+                if (k == 0 and i0 == 0 and s_air == i0 and not dep_gnd
+                        and base + ts[i0] / 10.0 - day_beg <= BOUNDARY_CUT_S):
+                    if dep is not None:
+                        cut_st["dep"] += 1
+                    dep = None
+                if (k == len(legs) - 1 and i1 == len(ts) - 1 and e_air == i1
+                        and not arr_gnd
+                        and day_end - (base + ts[i1] / 10.0) <= BOUNDARY_CUT_S):
+                    if arr is not None:
+                        cut_st["arr"] += 1
+                    arr = None
             # off_s/on_s only need to be comparable WITHIN this aircraft, so a
             # missing base_ts can fall back to 0 for the fill's reachability test
             b0 = base or 0
@@ -773,6 +809,9 @@ def main():
         # where filled dep/arr came from, and how many of each kind
         "routes_commit": routes.commit if routes else None,
         "fill": fill_st,
+        # airborne ends at the 00:00Z cut that resolved to a field and were
+        # dropped (BOUNDARY_CUT_S) -- before the chain/route fill
+        "boundary_cut": cut_st,
     }
     with open(os.path.join(a.out_dir, "legs_meta.json"), "w") as f:
         json.dump(meta_out, f, indent=1)
