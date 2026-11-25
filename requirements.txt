@@ -1,7 +1,7 @@
 numpy
 pmtiles
 pyarrow
-duckdb>=2,<3      # 2.0 removed fetch_record_batch and broke every nightly from 2026-10-22; take majors on purpose
+duckdb==2.0.0     # h3 community extension has no 2.0.1 build (404) -- every nightly from 2026-11-21 died in hexes; lift once it does. 2.0 removed fetch_record_batch (broke 2026-10-22)
 # only so DuckDB can materialise the TIMESTAMPTZ OOOI columns as Python
 # datetimes in ad-hoc queries; the pipeline itself reads them via epoch_ms()
 pytz
